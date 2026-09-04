@@ -35,9 +35,40 @@ herdr session stop work --json
 herdr session delete side-project --json
 ```
 
+## Saved SSH machines
+
+Save repeat targets to work across several machines from one Herdr client:
+
+```bash
+herdr machine add workbox --label "Build machine" --remote-session agents
+herdr machine add ssh://you@server:2222 --label "Production" --remote-session operations
+herdr machine list
+```
+
+Restart Herdr after changing the saved machine catalog. Enabled SSH machines then appear with Local in the machine sidebar. Select a machine or one of its workspaces to switch to it. Herdr keeps metadata, agent state, and notifications from connected machines available, but streams pane surfaces, input, geometry, and graphics only for the selected machine. Workspace, tab, pane, agent, and graphics identities stay scoped to their machine even when two servers happen to use the same internal ID.
+
+Herdr checks connected machines for application-level activity and uses a lightweight health probe while they are quiet. After sleep, a network interruption, or SSH failure, an unhealthy machine changes to Reconnecting and retries with bounded backoff. Its last workspace, agent, and selected pane state remains visible but dimmed and frozen; input and navigation into that cached state stay disabled until a fresh connection and coherent surface arrive. Reconnects never answer prompts or install, update, restart, or hand off a remote server. A target that needs host-key approval, authentication, or a compatible Herdr install shows Attention while Local and other machines keep working. Run the profile's explicit standalone command in a terminal to finish setup, for example:
+
+```bash
+herdr --remote workbox --session agents --handoff
+```
+
+Then restart the client. Rename, disable, or remove profiles by their opaque ID:
+
+```bash
+herdr machine rename <profile-id> --label "New name"
+herdr machine disable <profile-id>
+herdr machine enable <profile-id>
+herdr machine remove <profile-id>
+```
+
+Saved profiles contain only the opaque ID, label, SSH target, explicit remote session, and enabled state. Passwords, private keys, agent tickets, and SSH control sockets are never stored in the machine catalog.
+
+The client uses local keybindings by default. Custom commands advertised by the selected machine still execute on that machine. Herdr does not copy local command plugins, configuration, executables, or secrets to SSH hosts; a missing remote command or plugin fails visibly.
+
 ## Remote attach over SSH
 
-Herdr supports two remote modes. [How to work with Herdr](/docs/how-to-work/) compares them. SSH to the server and run `herdr` there for the tmux-style path, or attach through SSH from your local machine:
+Herdr supports two remote modes. [How to work with Herdr](/docs/how-to-work/) compares them. SSH to the server and run `herdr` there for the tmux-style path, use saved SSH machines for persistent multi-machine work, or attach through SSH from your local machine:
 
 ```bash
 herdr --remote workbox

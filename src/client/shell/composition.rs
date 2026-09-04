@@ -23,6 +23,11 @@ impl ClientShellState {
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
         self.last_composed_size = Some((cols, rows));
         let snapshot = self.snapshot.as_deref()?;
+        // A one-step successor is retained separately until its exact snapshot arrives; do not
+        // keep composing the now-superseded current pair while it is pending.
+        if self.pending_pane_surface.is_some() {
+            return None;
+        }
         let surface = self.pane_surface.as_ref()?;
         if snapshot.revision != surface.projection_revision {
             return None;
@@ -53,6 +58,9 @@ impl ClientShellState {
             snapshot,
             &self.config,
             render::ShellRenderState {
+                endpoints: &self.endpoints,
+                active_endpoint_id: &self.active_endpoint_id,
+                collapsed_endpoints: &self.collapsed_endpoints,
                 collapsed_groups: &self.collapsed_groups,
                 workspace_scroll: &mut self.workspace_scroll,
                 agent_scroll: &mut self.agent_scroll,
@@ -270,7 +278,14 @@ impl ClientShellState {
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         self.hits.notification_toast = Rect::default();
         let has_config_diagnostic = self.config_diagnostic.is_some();
+        let active_lifecycle = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == self.active_endpoint_id)
+            .filter(|endpoint| endpoint.status != ClientEndpointStatus::Online)
+            .map(|endpoint| (endpoint.label.clone(), endpoint.status));
         if has_config_diagnostic
+            || active_lifecycle.is_some()
             || self.visible_endpoint_notice.is_some()
             || self.visible_notification.is_some()
         {
@@ -289,21 +304,32 @@ impl ClientShellState {
                     &self.config.palette,
                 );
             }
+            let lifecycle_offset = active_lifecycle.as_ref().map_or(0, |(label, status)| {
+                let _ = endpoint_notices::render_lifecycle_banner(
+                    &mut composed,
+                    Rect::new(0, 0, cols, rows),
+                    label,
+                    *status,
+                    u16::from(has_config_diagnostic) + layout.mobile_header.height,
+                    &self.config.palette,
+                );
+                1
+            });
             if let Some(notice) = self.visible_endpoint_notice.as_ref() {
                 self.hits.notification_toast = if layout.mobile_header.is_empty() {
-                    notifications::render_endpoint_notice(
+                    endpoint_notices::render_notice(
                         &mut composed,
                         Rect::new(0, 0, cols, rows),
                         notice,
-                        u16::from(has_config_diagnostic),
+                        u16::from(has_config_diagnostic) + lifecycle_offset,
                         &self.config.palette,
                     )
                 } else {
-                    notifications::render_mobile_endpoint_notice_banner(
+                    endpoint_notices::render_mobile_banner(
                         &mut composed,
                         Rect::new(0, 0, cols, rows),
                         notice,
-                        has_config_diagnostic,
+                        has_config_diagnostic || lifecycle_offset > 0,
                         &self.config.palette,
                     )
                 };
@@ -314,7 +340,7 @@ impl ClientShellState {
                         Rect::new(0, 0, cols, rows),
                         notification,
                         self.config.toast_position,
-                        u16::from(has_config_diagnostic),
+                        u16::from(has_config_diagnostic) + lifecycle_offset,
                         &self.config.palette,
                     )
                 } else {
@@ -322,7 +348,7 @@ impl ClientShellState {
                         &mut composed,
                         Rect::new(0, 0, cols, rows),
                         notification,
-                        has_config_diagnostic,
+                        has_config_diagnostic || lifecycle_offset > 0,
                         &self.config.palette,
                     )
                 };
@@ -399,12 +425,33 @@ impl ClientShellState {
                 &mut composed,
                 Rect::new(0, 0, cols, rows),
                 snapshot,
+                &self.endpoints,
+                &self.active_endpoint_id,
                 &self.config,
                 self.navigate_workspace_id.as_deref(),
                 &mut self.mobile_switcher_scroll,
                 &mut self.reveal_mobile_workspace,
                 &mut self.hits,
             );
+            if let Some((label, status)) = active_lifecycle.as_ref() {
+                let _ = endpoint_notices::render_lifecycle_banner(
+                    &mut composed,
+                    Rect::new(0, 0, cols, rows),
+                    label,
+                    *status,
+                    2,
+                    &self.config.palette,
+                );
+            }
+            if let Some(notice) = self.visible_endpoint_notice.as_ref() {
+                self.hits.notification_toast = endpoint_notices::render_mobile_banner(
+                    &mut composed,
+                    Rect::new(0, 0, cols, rows),
+                    notice,
+                    active_lifecycle.is_some(),
+                    &self.config.palette,
+                );
+            }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
             self.hits.panes.clear();
             self.hits.pane_splits.clear();
@@ -431,6 +478,8 @@ impl ClientShellState {
                     &mut composed,
                     overlay,
                     snapshot,
+                    &self.endpoints,
+                    &self.active_endpoint_id,
                     &self.config.keybinds,
                     &self.config.palette,
                 )?;
@@ -473,6 +522,12 @@ impl ClientShellState {
             notes.scroll = notes
                 .scroll
                 .min(u16::try_from(self.hits.release_notes_max_scroll).unwrap_or(u16::MAX));
+        }
+        if self.endpoint_status(&self.active_endpoint_id) != Some(ClientEndpointStatus::Online) {
+            frame.cursor = None;
+            self.hits.panes.clear();
+            self.hits.pane_splits.clear();
+            self.hits.popup = None;
         }
         self.compose_graphics(&mut frame, layout);
         Some(frame)

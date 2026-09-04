@@ -1154,6 +1154,7 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     state.set_pane_surface(surface());
     let now = std::time::Instant::now();
     let (effects, repaint) = state.receive_notification(
+        &ClientEndpointId::Local,
         SemanticNotification {
             kind: SemanticNotificationKind::NeedsAttention,
             title: "codex needs attention".into(),
@@ -1215,6 +1216,7 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(state.visible_notification.is_none());
 
     state.receive_notification(
+        &ClientEndpointId::Local,
         SemanticNotification {
             kind: SemanticNotificationKind::NeedsAttention,
             title: "codex needs attention".into(),
@@ -1245,6 +1247,7 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(state.visible_notification.is_none());
 
     state.receive_notification(
+        &ClientEndpointId::Local,
         SemanticNotification {
             kind: SemanticNotificationKind::NeedsAttention,
             title: "first".into(),
@@ -1261,6 +1264,7 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(state.visible_notification.is_some());
     state.config.toast_delay_seconds = 1;
     let (_, repaint) = state.receive_notification(
+        &ClientEndpointId::Local,
         SemanticNotification {
             kind: SemanticNotificationKind::NeedsAttention,
             title: "replacement".into(),

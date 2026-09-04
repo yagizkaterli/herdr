@@ -239,11 +239,20 @@ impl HeadlessServer {
         {
             fallback!("unsafe_state");
         }
-        let targets = render_targets(&self.clients, self.foreground_client_id);
-        if targets.is_empty()
-            || targets
-                .iter()
-                .any(|target| !matches!(target.4, ClientConnectionMode::ClientShell))
+        let mut targets = render_targets(&self.clients, self.foreground_client_id);
+        targets.retain(|(client_id, _, _, _, mode)| {
+            !matches!(mode, ClientConnectionMode::ClientShell)
+                || self
+                    .clients
+                    .get(client_id)
+                    .is_some_and(|client| client.shell_surface_active)
+        });
+        if targets.is_empty() {
+            success!("no_active_surface");
+        }
+        if targets
+            .iter()
+            .any(|target| !matches!(target.4, ClientConnectionMode::ClientShell))
         {
             fallback!("non_shell_target");
         }

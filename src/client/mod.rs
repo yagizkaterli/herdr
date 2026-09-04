@@ -13,23 +13,45 @@
 //! - Displays sound/toast notifications forwarded from server
 
 mod attach;
+mod clipboard_forwarding;
 mod clipboard_images;
+mod config_reload;
 #[cfg(unix)]
 mod direct_graphics;
+pub(crate) mod endpoint;
 mod endpoint_commands;
 mod errors;
+mod events;
 mod frame_output;
 mod handshake;
 mod input;
+mod loop_config;
 mod notifications;
 mod shell;
+mod shell_runtime;
+mod startup;
+mod state;
 mod terminal_geometry;
 mod terminal_sessions;
 mod terminal_setup;
 mod timer;
+mod transport;
+
+#[cfg(test)]
+use clipboard_forwarding::decode_clipboard_payload;
+use clipboard_forwarding::forward_clipboard;
+#[cfg(test)]
+use config_reload::reload_local_client_config;
+use config_reload::{apply_reload, init_logging};
+use events::ClientLoopEvent;
+use loop_config::ClientLoopConfig;
+use shell_runtime::*;
+use state::ClientState;
+use transport::*;
 
 #[cfg(test)]
 pub(crate) use shell::{ClientShellConfig, ClientShellState};
+pub use startup::{run_client, run_terminal_attach};
 pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
 
 #[cfg(not(windows))]
@@ -65,7 +87,9 @@ use attach::direct_attach_pixel_mouse;
 use attach::AttachEscapeState;
 #[cfg(unix)]
 use attach::{write_attach_semantic_action, AttachInputAction};
-use clipboard_images::{client_remote_image_paste_key, write_remote_image_to_server};
+use clipboard_images::{
+    client_remote_image_paste_key, endpoint_accepts_local_images, write_remote_image_to_server,
+};
 #[cfg(windows)]
 use clipboard_images::{read_image_file_from_client_events, should_bridge_clipboard_image_events};
 #[cfg(unix)]
@@ -104,241 +128,11 @@ use tracing::{debug, info, warn};
 use crate::ipc::LocalStream;
 use crate::protocol::render_ansi;
 use crate::protocol::{
-    self, ClientMessage, FrameData, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE,
+    self, ClientMessage, FrameData, ServerMessage, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
 };
 #[cfg(test)]
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
-
-// ---------------------------------------------------------------------------
-// Client state
-// ---------------------------------------------------------------------------
-
-struct ClientLoopConfig {
-    sound_config: crate::config::SoundConfig,
-    mouse_scroll_lines: usize,
-    redraw_on_focus_gained: bool,
-    host_cursor: crate::config::HostCursorModeConfig,
-    kitty_graphics_enabled: bool,
-    pixel_geometry_enabled: bool,
-    pixel_geometry_fallback: bool,
-    mouse_capture_active: bool,
-    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
-    shell_config: Option<shell::ClientShellConfig>,
-}
-
-/// State tracking for the thin client.
-struct ClientState {
-    /// Stateful semantic-frame encoder used when the server sends FrameData.
-    blit_encoder: render_ansi::BlitEncoder,
-    /// Whether host mouse capture is currently active.
-    mouse_capture_active: bool,
-    /// Last mouse-capture demand published by the endpoint.
-    endpoint_mouse_capture_requested: bool,
-    /// Last exact-pixel mouse demand published by the endpoint.
-    endpoint_sgr_pixels_requested: bool,
-    /// Client-local direct-attach preference, combined with child mouse demand.
-    direct_mouse_capture_preference: bool,
-    /// Client-owned shell mouse-capture preference.
-    shell_mouse_capture_preference: bool,
-    /// Host keyboard protocol state currently owned for a direct terminal attach.
-    direct_keyboard_protocol: crate::terminal_modes::DirectHostKeyboardState,
-    /// Focused endpoint pane/popup demand for Kitty report-all input.
-    pane_keyboard_report_all: bool,
-    /// Whether the client-owned shell currently enabled host report-all input.
-    keyboard_report_all_active: bool,
-    /// The terminal size we reported to the server in our last handshake/Resize.
-    reported_size: (u16, u16),
-    /// Last exact host cell size used by client-rendered surfaces.
-    reported_cell_size: (u32, u32),
-    /// Client-local sound playback config, refreshed on server request.
-    sound_config: crate::config::SoundConfig,
-    /// Whether this client may write Kitty graphics bytes to its host terminal.
-    kitty_graphics_enabled: bool,
-    /// Whether resize reports inspect host pixel geometry.
-    pixel_geometry_enabled: bool,
-    /// Whether the latest host pixel geometry is exact enough for pixel mouse input.
-    pixel_geometry_exact: bool,
-    /// One bounded matcher, inactive unless a direct transmission is armed.
-    #[cfg(unix)]
-    direct_graphics_response: Arc<Mutex<direct_graphics::ResponseMatcher>>,
-    /// One server-retired direct transfer to suppress if it was still queued.
-    #[cfg(unix)]
-    retired_direct_graphics: Option<(u64, u32)>,
-    /// ClientShell assets waiting for the host terminal's direct-upload response.
-    #[cfg(unix)]
-    pending_surface_graphics: HashMap<u64, crate::protocol::SurfaceGraphicsAssetKey>,
-    /// Direct attach prefix escape state. None for ClientShell connections.
-    attach_escape: Option<AttachEscapeState>,
-    /// Rows scrolled for one direct-attach wheel notch.
-    #[cfg(unix)]
-    mouse_scroll_lines: usize,
-    /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
-    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
-    /// Whether outer focus gain should force a full host-terminal redraw.
-    redraw_on_focus_gained: bool,
-    /// Whether the next semantic frame must repaint every cell without clearing the surface.
-    repaint_pending: bool,
-    /// Whether this client draws the cursor into frame cells instead of using the host cursor.
-    draw_host_cursor: bool,
-    /// Browser opener processes launched by client-owned link activation.
-    detached_process_children: Vec<std::process::Child>,
-    /// Experimental client-owned shell state.
-    shell: Option<shell::ClientShellState>,
-}
-
-impl Drop for ClientState {
-    fn drop(&mut self) {
-        if self.attach_escape.is_some() {
-            let _ = crate::terminal_modes::set_direct_host_keyboard_protocol(
-                &mut io::stdout(),
-                &mut self.direct_keyboard_protocol,
-                0,
-                0,
-            );
-        }
-    }
-}
-
-impl ClientState {
-    fn request_repaint(&mut self) {
-        self.repaint_pending = true;
-    }
-
-    fn present_graphics(&mut self, graphics: &[u8]) {
-        if graphics.is_empty() || !self.kitty_graphics_enabled {
-            return;
-        }
-        let mut stdout = io::stdout();
-        let _ = write_encoded_frame_with_graphics(&mut stdout, &[], graphics);
-        let _ = stdout.flush();
-    }
-
-    fn present_surface_patch(
-        &mut self,
-        patch: shell::ClientComposedSurfacePatch,
-    ) -> io::Result<bool> {
-        if self.repaint_pending {
-            crate::render_prof::event("client_surface_patch.fallback.repaint");
-            return Ok(false);
-        }
-        let rows = if self.draw_host_cursor {
-            let Some(rows) = self
-                .blit_encoder
-                .patch_rows_with_drawn_cursor(&patch.rows, patch.cursor.as_ref())
-            else {
-                crate::render_prof::event("client_surface_patch.fallback.drawn_cursor");
-                return Ok(false);
-            };
-            rows
-        } else {
-            patch.rows
-        };
-        let encode_started = crate::render_prof::timer();
-        let Some(encoded) =
-            self.blit_encoder
-                .encode_patch(&rows, patch.cursor.clone(), self.draw_host_cursor)
-        else {
-            crate::render_prof::event("client_surface_patch.fallback.encode");
-            return Ok(false);
-        };
-        crate::render_prof::duration_since("client_surface_patch.encode", encode_started);
-        let write_started = crate::render_prof::timer();
-        let mut stdout = io::stdout();
-        stdout.write_all(&encoded.bytes)?;
-        stdout.flush()?;
-        crate::render_prof::duration_since("client_surface_patch.write", write_started);
-        let committed = self.blit_encoder.commit_patch(&rows, patch.cursor, encoded);
-        crate::render_prof::event(if committed {
-            "client_surface_patch.success"
-        } else {
-            "client_surface_patch.fallback.commit"
-        });
-        Ok(committed)
-    }
-
-    fn present_frame(&mut self, frame_data: FrameData) {
-        let frame_data = if self.draw_host_cursor {
-            render_ansi::frame_with_drawn_cursor(frame_data)
-        } else {
-            frame_data
-        };
-        let encoded = if self.draw_host_cursor {
-            self.blit_encoder
-                .encode_with_suppressed_visible_cursor(&frame_data, self.repaint_pending)
-        } else {
-            self.blit_encoder.encode(&frame_data, self.repaint_pending)
-        };
-        let mut stdout = io::stdout();
-        let graphics = if self.kitty_graphics_enabled {
-            frame_data.graphics.as_slice()
-        } else {
-            &[]
-        };
-        let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-        let _ = stdout.flush();
-        self.blit_encoder.commit(frame_data, encoded);
-        self.repaint_pending = false;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Client event loop
-// ---------------------------------------------------------------------------
-
-/// Internal events for the client event loop.
-enum ClientLoopEvent {
-    /// Raw input bytes from stdin.
-    #[cfg(unix)]
-    StdinInput(Vec<u8>),
-    /// One confirmed SGR pixel report with geometry captured by the reader.
-    #[cfg(unix)]
-    PixelMouse(Vec<u8>, crate::input::mouse::HostGeometry),
-    #[cfg(unix)]
-    DirectGraphicsResponse(direct_graphics::Response),
-    /// Structured input events from platforms without Unix-style stdin bytes.
-    #[cfg(windows)]
-    StdinEvents(Vec<crate::protocol::ClientInputEvent>),
-    /// Terminal resize detected, including current exact-pixel eligibility.
-    Resize(u16, u16, u32, u32, bool),
-    /// The client's host terminal can no longer report a valid grid.
-    TerminalUnavailable(io::Error),
-    /// Server message received.
-    ServerMessage(Box<ServerMessage>),
-    /// Server reader thread exited (connection lost).
-    ServerDisconnected,
-    /// Timer tick.
-    Timer,
-}
-
-/// Runs the thin client: connects to the server, performs the handshake,
-/// and enters the main event loop.
-///
-/// This is the entry point called from `main.rs` when running in client mode.
-pub fn run_client() -> io::Result<()> {
-    run_client_with_mode(None, None, "connecting to server")
-}
-
-/// Runs a direct terminal attach client.
-#[cfg(unix)]
-pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()> {
-    run_client_with_mode(
-        Some((terminal_id, takeover)),
-        Some(AttachEscapeState::default()),
-        "attaching to terminal",
-    )
-}
-
-/// Direct terminal attach is Unix raw-byte input only until Windows gets a semantic attach path.
-#[cfg(windows)]
-pub fn run_terminal_attach(_terminal_id: String, _takeover: bool) -> io::Result<()> {
-    debug_assert!(!crate::platform::capabilities().direct_terminal_attach);
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "direct terminal attach is not supported on Windows yet",
-    ))
-}
 
 fn run_client_with_mode(
     attach_request: Option<(String, bool)>,
@@ -373,6 +167,9 @@ fn run_client_with_mode(
     let kitty_graphics_enabled =
         loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
     let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
+    let endpoint_keybindings = shell_config
+        .as_ref()
+        .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -382,6 +179,7 @@ fn run_client_with_mode(
         pixel_geometry_enabled,
         pixel_geometry_fallback: kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
+        endpoint_keybindings,
         remote_image_paste_key,
         shell_config,
     };
@@ -408,11 +206,6 @@ fn run_client_with_mode(
         .shell_config
         .as_ref()
         .map(|shell| shell.initial_surface_size(cols, rows));
-    let endpoint_keybindings = loop_config
-        .shell_config
-        .as_ref()
-        .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
-
     // Perform handshake while the stream is still in blocking mode.
     let handshake = match do_handshake(
         &mut stream,
@@ -424,6 +217,7 @@ fn run_client_with_mode(
         shell_surface_size,
         endpoint_keybindings,
         loop_config.mouse_capture_active,
+        true,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -491,8 +285,7 @@ fn run_client_with_mode(
             exact_cell_size,
             should_quit,
             loop_config,
-            handshake.encoding,
-            handshake.endpoint_methods,
+            handshake,
             attach_escape,
         )
         .await
@@ -526,187 +319,6 @@ fn run_client_with_mode(
     Ok(())
 }
 
-fn dispatch_client_shell_actions(
-    actions: Vec<shell::ClientShellAction>,
-    endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    write_stream: &mut LocalStream,
-    detached_process_children: &mut Vec<std::process::Child>,
-) -> Result<Vec<crossterm::event::MouseEvent>, ClientError> {
-    let mut replay_mouse = Vec::new();
-    for action in actions {
-        match action {
-            shell::ClientShellAction::Endpoint { boot_id, request } => {
-                endpoint_commands.enqueue(boot_id, request);
-            }
-            shell::ClientShellAction::ClipboardWrite(bytes) => {
-                crate::selection::write_osc52_bytes(&bytes);
-            }
-            shell::ClientShellAction::Request(request) => {
-                write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
-            }
-            shell::ClientShellAction::OpenSafeWebUrl(url) => {
-                if crate::app::actions::safe_web_url(&url).is_some() {
-                    match crate::platform::open_url(&url) {
-                        Ok(Some(child)) => detached_process_children.push(child),
-                        Ok(None) => {}
-                        Err(err) => warn!(err = %err, url = %url, "failed to open pane URL"),
-                    }
-                }
-            }
-            shell::ClientShellAction::ReplayMouse(events) => replay_mouse.extend(events),
-            shell::ClientShellAction::Keybind(action) => {
-                debug!(
-                    ?action,
-                    "client shell action awaits its presentation family"
-                );
-            }
-        }
-    }
-    endpoint_commands
-        .send_next(write_stream)
-        .map_err(ClientError::ConnectionLost)?;
-    Ok(replay_mouse)
-}
-
-fn client_shell_resize_message(
-    shell: &shell::ClientShellState,
-    cols: u16,
-    rows: u16,
-    cell_width_px: u32,
-    cell_height_px: u32,
-    pixel_mouse: bool,
-) -> ClientMessage {
-    ClientMessage::ClientShellResize {
-        cell_width_px,
-        cell_height_px,
-        surface_size: shell.surface_size(cols, rows),
-        pixel_mouse,
-    }
-}
-
-fn sync_client_shell_keyboard_report_all(state: &mut ClientState) -> Result<(), ClientError> {
-    let Some(shell) = state.shell.as_ref() else {
-        return Ok(());
-    };
-    let desired = state.pane_keyboard_report_all || shell.host_keyboard_report_all_requested();
-    if desired == state.keyboard_report_all_active {
-        return Ok(());
-    }
-    crate::terminal_modes::set_host_kitty_keyboard_report_all(&mut io::stdout(), desired)
-        .map_err(ClientError::ConnectionFailed)?;
-    state.keyboard_report_all_active = desired;
-    Ok(())
-}
-
-fn apply_client_shell_input_source_changes(
-    state: &mut ClientState,
-    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
-) {
-    let changes = state
-        .shell
-        .as_mut()
-        .map(shell::ClientShellState::take_input_source_changes)
-        .unwrap_or_default();
-    for active in changes {
-        if active {
-            prefix_input_source.switch_to_ascii();
-        } else {
-            prefix_input_source.restore();
-        }
-    }
-}
-
-fn install_client_shell_snapshot(
-    state: &mut ClientState,
-    snapshot: Box<crate::protocol::ClientShellSnapshot>,
-    write_stream: &mut LocalStream,
-    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
-) -> Result<(), ClientError> {
-    let (composed, resize, graphics_cleanup) = if let Some(shell) = &mut state.shell {
-        let previous_size = shell.surface_size(state.reported_size.0, state.reported_size.1);
-        shell.set_snapshot(snapshot);
-        let graphics_cleanup = shell.take_pending_graphics_cleanup();
-        let next_size = shell.surface_size(state.reported_size.0, state.reported_size.1);
-        (
-            shell.compose(state.reported_size.0, state.reported_size.1),
-            (previous_size != next_size).then(|| {
-                client_shell_resize_message(
-                    shell,
-                    state.reported_size.0,
-                    state.reported_size.1,
-                    state.reported_cell_size.0,
-                    state.reported_cell_size.1,
-                    state.pixel_geometry_exact,
-                )
-            }),
-            graphics_cleanup,
-        )
-    } else {
-        (None, None, Vec::new())
-    };
-    apply_client_shell_input_source_changes(state, prefix_input_source);
-    state.present_graphics(&graphics_cleanup);
-    if let Some(resize) = resize {
-        write_to_server(write_stream, &resize).map_err(ClientError::ConnectionLost)?;
-    }
-    if let Some(frame) = composed {
-        state.present_frame(frame);
-    }
-    Ok(())
-}
-
-fn finish_client_shell_input(
-    state: &mut ClientState,
-    outcome: shell::ClientShellInput,
-    frame: Option<FrameData>,
-    write_stream: &mut LocalStream,
-    endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
-) -> Result<bool, ClientError> {
-    apply_client_shell_input_source_changes(state, prefix_input_source);
-    if outcome.detach {
-        let _ = write_to_server(write_stream, &ClientMessage::Detach);
-        return Ok(true);
-    }
-    if outcome.resize {
-        let shell = state.shell.as_ref().expect("shell mode remains active");
-        let resize = client_shell_resize_message(
-            shell,
-            state.reported_size.0,
-            state.reported_size.1,
-            state.reported_cell_size.0,
-            state.reported_cell_size.1,
-            state.pixel_geometry_exact,
-        );
-        write_to_server(write_stream, &resize).map_err(ClientError::ConnectionLost)?;
-    }
-    #[cfg(not(windows))]
-    if outcome.query_host_appearance {
-        query_host_terminal_appearance();
-    }
-    if outcome.query_host_theme {
-        query_host_terminal_theme();
-    }
-    sync_client_shell_keyboard_report_all(state)?;
-    let replay = dispatch_client_shell_actions(
-        outcome.actions,
-        endpoint_commands,
-        write_stream,
-        &mut state.detached_process_children,
-    )?;
-    debug_assert!(
-        replay.is_empty(),
-        "mouse replay only follows endpoint results"
-    );
-    for request in outcome.requests {
-        write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
-    }
-    if let Some(frame) = frame {
-        state.present_frame(frame);
-    }
-    Ok(false)
-}
-
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -723,8 +335,7 @@ async fn run_client_loop(
     initial_pixel_geometry_exact: bool,
     should_quit: Arc<AtomicBool>,
     config: ClientLoopConfig,
-    negotiated_encoding: RenderEncoding,
-    endpoint_methods: Option<Vec<String>>,
+    handshake: handshake::HandshakeResult,
     attach_escape: Option<AttachEscapeState>,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
@@ -737,6 +348,7 @@ async fn run_client_loop(
         mouse_capture_active: config.mouse_capture_active,
         endpoint_mouse_capture_requested: false,
         endpoint_sgr_pixels_requested: false,
+        host_theme_updates: Vec::new(),
         direct_mouse_capture_preference: attach_escape.is_some() && config.mouse_capture_active,
         shell_mouse_capture_preference: config.mouse_capture_active,
         direct_keyboard_protocol: crate::terminal_modes::DirectHostKeyboardState::default(),
@@ -760,15 +372,28 @@ async fn run_client_loop(
         remote_image_paste_key: config.remote_image_paste_key,
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
+        presentation_frozen: false,
         draw_host_cursor,
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
+    let mut endpoint_catalog = if state.shell.is_some() && !is_remote_client {
+        endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
+            warn!(%error, "saved SSH endpoint catalog is unavailable");
+            endpoint::EndpointCatalog::default()
+        })
+    } else {
+        endpoint::EndpointCatalog::default()
+    };
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
-        shell.set_endpoint_methods(endpoint_methods);
+        shell.set_endpoint_catalog(&endpoint_catalog.ssh);
+        shell.set_endpoint_methods_for(
+            &endpoint::ClientEndpointId::Local,
+            handshake.endpoint_methods.clone(),
+        );
     }
-    debug!(?negotiated_encoding, "client render encoding active");
+    debug!(encoding = ?handshake.encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
@@ -777,6 +402,7 @@ async fn run_client_loop(
 
     // Channel for events from the resize and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    let (ssh_tx, mut ssh_rx) = tokio::sync::mpsc::channel::<endpoint::SshSupervisorEvent>(64);
     // Keep Windows console draining independent of server-frame backpressure.
     #[cfg(windows)]
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
@@ -867,15 +493,33 @@ async fn run_client_loop(
             server_read_tx,
             &server_read_quit,
             max_frame_size,
+            endpoint::ClientEndpointId::Local,
+            1,
         );
     });
 
     // Use the original stream for writing (blocking is fine since we write
     // from the async loop).
-    let mut write_stream = stream;
-    write_stream
+    stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
+    let local_negotiation = endpoint::EndpointNegotiation::new(
+        handshake.endpoint_methods.unwrap_or_default(),
+        handshake.endpoint_capabilities.unwrap_or_default(),
+    );
+    let mut write_stream = endpoint::EndpointRegistry::new(
+        endpoint::NativeEndpointTransport::new(stream),
+        1,
+        local_negotiation,
+    );
+    if state.shell.is_some() {
+        write_stream.send(&ClientMessage::ClientShellFocus { focused: true });
+    }
+    let mut ssh_supervisors =
+        endpoint::SshSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
+    let mut next_surface_serial = 1_u64;
+    let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
+    let mut scheduled_activation = None;
 
     // This (foreground) client owns the prefix ASCII input-source switch
     // (implemented on macOS and Windows; a no-op on other platforms).
@@ -886,6 +530,22 @@ async fn run_client_loop(
     #[cfg(windows)]
     let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
+        if let Some(shell) = state.shell.as_ref() {
+            ssh_supervisors.spawn_due(
+                std::time::Instant::now(),
+                endpoint::SshConnectOptions {
+                    cols: state.reported_size.0,
+                    rows: state.reported_size.1,
+                    cell_width_px: state.reported_cell_size.0,
+                    cell_height_px: state.reported_cell_size.1,
+                    pixel_geometry_exact: state.pixel_geometry_exact,
+                    surface_size: shell.surface_size(state.reported_size.0, state.reported_size.1),
+                    endpoint_keybindings: config.endpoint_keybindings,
+                    mouse_capture: state.shell_mouse_capture_preference,
+                },
+                &ssh_tx,
+            );
+        }
         let timer_delay = state
             .shell
             .as_ref()
@@ -893,23 +553,34 @@ async fn run_client_loop(
                 shell.timer_delay(std::time::Instant::now())
             });
         let timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
+        let immediate_event = scheduled_activation.take();
         #[cfg(windows)]
-        let event = tokio::select! {
-            _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
-            ev = stdin_rx.recv(), if stdin_open => match ev {
-                Some(event) => event,
-                None => {
-                    stdin_open = false;
-                    ClientLoopEvent::Timer
-                }
-            },
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+        let event = if let Some(event) = immediate_event {
+            event
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
+                ev = stdin_rx.recv(), if stdin_open => match ev {
+                    Some(event) => event,
+                    None => {
+                        stdin_open = false;
+                        ClientLoopEvent::Timer
+                    }
+                },
+                ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+                ev = ssh_rx.recv() => ev.map(ClientLoopEvent::SshSupervisor).unwrap_or(ClientLoopEvent::Timer),
+            }
         };
         #[cfg(unix)]
-        let event = tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+        let event = if let Some(event) = immediate_event {
+            event
+        } else {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
+                ev = ssh_rx.recv() => ev.map(ClientLoopEvent::SshSupervisor).unwrap_or(ClientLoopEvent::Timer),
+                ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+            }
         };
         let now = std::time::Instant::now();
         if let Some(shell) = state.shell.as_mut() {
@@ -919,6 +590,11 @@ async fn run_client_loop(
         match event {
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
+                let image_bridge_active = endpoint_accepts_local_images(
+                    is_remote_client,
+                    write_stream.active_id(),
+                    write_stream.active_surface_available(),
+                );
                 if state.shell.is_some() {
                     if will_query_host_cell_size {
                         let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
@@ -934,7 +610,7 @@ async fn run_client_loop(
                     if let Some(target) = image_target.clone() {
                         if should_bridge_clipboard_image_paste(
                             &data,
-                            is_remote_client,
+                            image_bridge_active,
                             state.remote_image_paste_key,
                         ) {
                             if let Some(image) = crate::platform::read_clipboard_image() {
@@ -951,7 +627,7 @@ async fn run_client_loop(
                             );
                         }
                         if let Some(image) =
-                            read_image_file_from_terminal_drop(&data, is_remote_client)
+                            read_image_file_from_terminal_drop(&data, image_bridge_active)
                         {
                             write_remote_image_to_server(
                                 &mut write_stream,
@@ -976,8 +652,10 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
+                        &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
+                        &event_tx,
                     )? {
                         return Ok(());
                     }
@@ -1048,7 +726,7 @@ async fn run_client_loop(
                 };
                 if should_bridge_clipboard_image_paste(
                     &data,
-                    is_remote_client,
+                    image_bridge_active,
                     state.remote_image_paste_key,
                 ) {
                     if let Some(image) = crate::platform::read_clipboard_image() {
@@ -1064,7 +742,8 @@ async fn run_client_loop(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
                 }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, is_remote_client) {
+                if let Some(image) = read_image_file_from_terminal_drop(&data, image_bridge_active)
+                {
                     write_remote_image_to_server(
                         &mut write_stream,
                         crate::protocol::ClientClipboardImageTarget::DirectTerminal,
@@ -1080,11 +759,28 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::DirectGraphicsResponse(response) => {
-                let composed = state
+                let pending_key = state
                     .pending_surface_graphics
-                    .remove(&response.transfer_id)
+                    .keys()
+                    .find(|(_, transfer_id, image_id)| {
+                        *transfer_id == response.transfer_id && *image_id == response.image_id
+                    })
+                    .cloned();
+                let owner = pending_key
+                    .as_ref()
+                    .map(|(endpoint_id, _, _)| endpoint_id.clone());
+                let composed = pending_key
+                    .and_then(|key| {
+                        state
+                            .pending_surface_graphics
+                            .remove(&key)
+                            .map(|asset| (key, asset))
+                    })
                     .filter(|_| response.success)
-                    .and_then(|asset| {
+                    .and_then(|((endpoint_id, _, _), asset)| {
+                        if write_stream.active_id() != &endpoint_id {
+                            return None;
+                        }
                         let shell = state.shell.as_mut()?;
                         shell
                             .trust_direct_graphics_asset(&asset, response.image_id)
@@ -1096,8 +792,8 @@ async fn run_client_loop(
                     image_id: response.image_id,
                     success: response.success,
                 };
-                if let Err(err) = write_to_server(&mut write_stream, &message) {
-                    return Err(ClientError::ConnectionLost(err));
+                if let Some(owner) = owner {
+                    write_stream.send_to(&owner, &message);
                 }
                 if let Some(frame) = composed {
                     state.present_frame(frame);
@@ -1120,8 +816,10 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
+                        &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
+                        &event_tx,
                     )? {
                         return Ok(());
                     }
@@ -1159,6 +857,11 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
+                let image_bridge_active = endpoint_accepts_local_images(
+                    is_remote_client,
+                    write_stream.active_id(),
+                    write_stream.active_surface_available(),
+                );
                 if state.shell.is_some() {
                     let image_target = state
                         .shell
@@ -1167,7 +870,7 @@ async fn run_client_loop(
                     if let Some(target) = image_target.clone() {
                         if should_bridge_clipboard_image_events(
                             &events,
-                            is_remote_client,
+                            image_bridge_active,
                             state.remote_image_paste_key,
                         ) {
                             if let Some(image) = crate::platform::read_clipboard_image() {
@@ -1184,7 +887,7 @@ async fn run_client_loop(
                             );
                         }
                         if let Some(image) =
-                            read_image_file_from_client_events(&events, is_remote_client)
+                            read_image_file_from_client_events(&events, image_bridge_active)
                         {
                             write_remote_image_to_server(
                                 &mut write_stream,
@@ -1209,8 +912,10 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
+                        &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
+                        &event_tx,
                     )? {
                         return Ok(());
                     }
@@ -1262,181 +967,287 @@ async fn run_client_loop(
                         pixel_mouse: pixel_geometry_exact,
                     }
                 };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Some(activation) = pending_activation.as_mut() {
+                    if let Err(error) = activation.update_resize(msg, &mut write_stream) {
+                        rollback_endpoint_activation(
+                            &mut state,
+                            &mut write_stream,
+                            &mut pending_activation,
+                            error,
+                            false,
+                        );
+                    }
+                } else if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match *msg {
-                ServerMessage::ClientShellSnapshot(_) => {
-                    return Err(ClientError::Protocol(protocol::FramingError::Io(
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "server sent an unnegotiated binary endpoint snapshot",
-                        ),
-                    )));
-                }
-                ServerMessage::PaneSurface(surface) => {
-                    let composed = if let Some(shell) = &mut state.shell {
-                        shell.set_pane_surface(surface);
+            ClientLoopEvent::SshSupervisor(event) => match event {
+                endpoint::SshSupervisorEvent::Status {
+                    endpoint_id,
+                    generation,
+                    status,
+                    message,
+                } => {
+                    if !ssh_supervisors.record_status(&endpoint_id, generation, status, now) {
+                        continue;
+                    }
+                    let unavailable = state.shell.as_mut().and_then(|shell| {
+                        shell.set_endpoint_status(&endpoint_id, status);
+                        (status == endpoint::ClientEndpointStatus::Attention
+                            && shell.endpoint_is_active(&endpoint_id))
+                        .then(|| format!("{}: {message}", shell.endpoint_label(&endpoint_id)))
+                    });
+                    if let Some(message) = unavailable {
+                        present_handoff_unavailable(&mut state, message);
+                    } else if let Some(frame) = state.shell.as_mut().and_then(|shell| {
                         shell.compose(state.reported_size.0, state.reported_size.1)
-                    } else {
-                        None
-                    };
-                    apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
-                    if let Some(frame) = composed {
+                    }) {
                         state.present_frame(frame);
                     }
                 }
-                ServerMessage::PaneSurfacePatch(patch) => {
-                    let patch_started = crate::render_prof::timer();
-                    let apply_started = crate::render_prof::timer();
-                    let outcome = state
-                        .shell
-                        .as_mut()
-                        .map(|shell| shell.apply_pane_surface_patch(patch));
-                    crate::render_prof::duration_since("client_surface_patch.apply", apply_started);
-                    let compose_fallback = match outcome {
-                        Some(shell::ClientPaneSurfacePatchOutcome::Applied(Some(patch))) => {
-                            match state.present_surface_patch(patch) {
-                                Ok(presented) => !presented,
-                                Err(error) => {
-                                    warn!(%error, "failed to present retained pane surface patch");
-                                    state.request_repaint();
-                                    false
+                endpoint::SshSupervisorEvent::Connected {
+                    endpoint_id,
+                    generation,
+                    reader,
+                    writer,
+                    negotiation,
+                } => {
+                    if !ssh_supervisors.record_status(
+                        &endpoint_id,
+                        generation,
+                        endpoint::ClientEndpointStatus::Online,
+                        now,
+                    ) {
+                        continue;
+                    }
+                    let frame = state.shell.as_mut().and_then(|shell| {
+                        shell.set_endpoint_methods_for(&endpoint_id, Some(negotiation.methods()));
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    });
+                    write_stream.insert(
+                        endpoint_id.clone(),
+                        writer,
+                        generation,
+                        negotiation,
+                        false,
+                    );
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
+                    let reader_tx = event_tx.clone();
+                    let reader_quit = should_quit.clone();
+                    std::thread::spawn(move || {
+                        server_reader_thread(
+                            reader,
+                            reader_tx,
+                            &reader_quit,
+                            MAX_GRAPHICS_FRAME_SIZE,
+                            endpoint_id,
+                            generation,
+                        );
+                    });
+                }
+            },
+            ClientLoopEvent::ActivateEndpoint {
+                endpoint_id,
+                target,
+                force,
+            } => {
+                if endpoint_catalog.select_endpoint(&endpoint_id) {
+                    if let Err(error) = endpoint_catalog.store_selection() {
+                        warn!(%error, "failed to persist desired endpoint selection");
+                    }
+                }
+                begin_endpoint_activation(
+                    &mut state,
+                    &mut write_stream,
+                    &mut endpoint_commands,
+                    &mut pending_activation,
+                    &mut next_surface_serial,
+                    endpoint_id,
+                    target,
+                    force,
+                    now,
+                    &event_tx,
+                )?;
+            }
+            ClientLoopEvent::ServerMessage {
+                endpoint_id,
+                generation,
+                message,
+            } => {
+                if !write_stream.accepts(&endpoint_id, generation) {
+                    continue;
+                }
+                write_stream.received(&endpoint_id, generation, now);
+                let endpoint_active = write_stream.active_id() == &endpoint_id
+                    && write_stream
+                        .connection(&endpoint_id)
+                        .is_some_and(|connection| connection.surface_active);
+                let activation_message = pending_activation
+                    .as_ref()
+                    .is_some_and(|pending| pending.accepts_endpoint(&endpoint_id, generation));
+                let command_response = match message.as_ref() {
+                    ServerMessage::ClientShellEndpointResponseChunk {
+                        boot_id,
+                        request_id,
+                        ..
+                    } => endpoint_commands.accepts_response(
+                        &endpoint_id,
+                        generation,
+                        boot_id,
+                        request_id,
+                    ),
+                    _ => false,
+                };
+                if !endpoint::accepts_endpoint_message(
+                    endpoint_active,
+                    activation_message,
+                    command_response,
+                    message.as_ref(),
+                ) {
+                    continue;
+                }
+                // Target presentation effects may arrive as soon as surface.set(true) is
+                // acknowledged. They cannot be applied while the source frame is frozen; the
+                // target receives one explicit replay after the coherent commit instead.
+                if state.presentation_frozen
+                    && activation_message
+                    && endpoint::is_presentation_effect(message.as_ref())
+                {
+                    continue;
+                }
+                match *message {
+                    ServerMessage::ClientShellSnapshot(_) => {
+                        let message = "server sent an unnegotiated binary endpoint snapshot";
+                        if !endpoint_id.is_local() {
+                            if handle_remote_endpoint_attention(
+                                &mut state,
+                                &mut write_stream,
+                                &mut endpoint_commands,
+                                &mut ssh_supervisors,
+                                &mut pending_activation,
+                                &endpoint_id,
+                                generation,
+                                now,
+                                message.into(),
+                            ) {
+                                clear_endpoint_host_effects(
+                                    &mut state,
+                                    &host_mouse_capture_active,
+                                    &host_sgr_pixels_active,
+                                );
+                            }
+                            continue;
+                        }
+                        return Err(ClientError::Protocol(protocol::FramingError::Io(
+                            io::Error::new(io::ErrorKind::InvalidData, message),
+                        )));
+                    }
+                    ServerMessage::PaneSurface(surface) => {
+                        if activation_message {
+                            let progress = pending_activation.as_mut().map(|pending| {
+                                pending.receive_surface(&endpoint_id, generation, surface)
+                            });
+                            if matches!(progress, Some(endpoint::SurfaceActivationProgress::Ready))
+                            {
+                                if let Some(event) = complete_endpoint_activation(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut pending_activation,
+                                    &mut endpoint_commands,
+                                )? {
+                                    scheduled_activation = Some(event);
                                 }
                             }
+                            continue;
                         }
-                        Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => true,
-                        Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => false,
-                    };
-                    apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
-                    if compose_fallback {
-                        let composed = state.shell.as_mut().and_then(|shell| {
+                        if !endpoint_active {
+                            continue;
+                        }
+                        let composed = if let Some(shell) = &mut state.shell {
+                            shell.set_pane_surface(surface);
                             shell.compose(state.reported_size.0, state.reported_size.1)
-                        });
+                        } else {
+                            None
+                        };
+                        apply_client_shell_input_source_changes(
+                            &mut state,
+                            &mut prefix_input_source,
+                        );
                         if let Some(frame) = composed {
                             state.present_frame(frame);
                         }
                     }
-                    crate::render_prof::duration_since("client_surface_patch.total", patch_started);
-                    crate::render_prof::flush_if_due();
-                }
-                ServerMessage::Terminal(frame) => {
-                    if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
-                        record_received_kitty_graphics(&frame.bytes);
-                    }
-                    let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&frame.bytes);
-                    let _ = stdout.flush();
-                }
-                ServerMessage::Graphics { bytes } => {
-                    if state.kitty_graphics_enabled {
-                        record_received_kitty_graphics(&bytes);
-                        let mut stdout = io::stdout();
-                        let _ = stdout.write_all(&bytes);
-                        let _ = stdout.flush();
-                    }
-                }
-                ServerMessage::TerminalBell { count } => {
-                    if let Err(err) =
-                        crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
-                    {
-                        warn!(err = %err, "failed to emit terminal bell");
-                    }
-                }
-                ServerMessage::GraphicsFile {
-                    path,
-                    expected_len,
-                    image_id,
-                    transfer_id,
-                    leading,
-                    control,
-                    surface_asset,
-                } => {
-                    #[cfg(unix)]
-                    {
-                        if state.retired_direct_graphics.take() == Some((transfer_id, image_id)) {
-                            continue;
-                        }
-                        let surface_asset_valid = match (state.shell.as_ref(), &surface_asset) {
-                            (Some(shell), Some(asset)) => {
-                                crate::kitty_graphics::surface::host_image_id(
-                                    shell.graphics_scope(),
-                                    asset,
-                                ) == image_id
-                            }
-                            (None, None) => true,
-                            _ => false,
-                        };
-                        let valid = state.kitty_graphics_enabled
-                            && surface_asset_valid
-                            && usize::try_from(expected_len).ok().is_some_and(|len| {
-                                crate::pane_graphics_files::validate_direct_source(
-                                    std::path::Path::new(&path),
-                                    len,
-                                )
-                                .is_ok()
-                                    && direct_graphics::valid_control(&control, image_id, len)
-                            })
-                            && state
-                                .direct_graphics_response
-                                .lock()
-                                .is_ok_and(|mut matcher| matcher.arm(transfer_id, image_id));
-                        let sent = if valid {
-                            let mut command = Vec::new();
-                            crate::kitty_graphics::encode_kitty_regular_file(
-                                &mut command,
-                                &leading,
-                                &control,
-                                &path,
-                            );
-                            let mut stdout = io::stdout();
-                            let written = stdout
-                                .write_all(&command)
-                                .and_then(|()| stdout.flush())
-                                .is_ok();
-                            if written {
-                                record_received_kitty_graphics(&command);
-                            }
-                            written
-                        } else {
-                            false
-                        };
-                        if sent {
-                            if let Some(asset) = surface_asset {
-                                state.pending_surface_graphics.insert(transfer_id, asset);
-                            }
-                            if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                                matcher.start(transfer_id);
-                            }
-                            let started = ClientMessage::GraphicsTransmissionStarted {
-                                transfer_id,
-                                image_id,
-                            };
-                            if let Err(err) = write_to_server(&mut write_stream, &started) {
-                                return Err(ClientError::ConnectionLost(err));
-                            }
-                        } else {
-                            state.pending_surface_graphics.remove(&transfer_id);
-                            if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                                if valid {
-                                    matcher.retire(transfer_id);
-                                } else {
-                                    matcher.cancel(transfer_id);
+                    ServerMessage::PaneSurfacePatch(patch) => {
+                        let patch_started = crate::render_prof::timer();
+                        let apply_started = crate::render_prof::timer();
+                        let outcome = state
+                            .shell
+                            .as_mut()
+                            .map(|shell| shell.apply_pane_surface_patch(patch));
+                        crate::render_prof::duration_since(
+                            "client_surface_patch.apply",
+                            apply_started,
+                        );
+                        let compose_fallback = match outcome {
+                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(Some(patch))) => {
+                                match state.present_surface_patch(patch) {
+                                    Ok(presented) => !presented,
+                                    Err(error) => {
+                                        warn!(%error, "failed to present retained pane surface patch");
+                                        state.request_repaint();
+                                        false
+                                    }
                                 }
                             }
-                            let result = ClientMessage::GraphicsTransmissionResult {
-                                transfer_id,
-                                image_id,
-                                success: false,
-                            };
-                            if let Err(err) = write_to_server(&mut write_stream, &result) {
-                                return Err(ClientError::ConnectionLost(err));
+                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => true,
+                            Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => false,
+                        };
+                        apply_client_shell_input_source_changes(
+                            &mut state,
+                            &mut prefix_input_source,
+                        );
+                        if compose_fallback {
+                            let composed = state.shell.as_mut().and_then(|shell| {
+                                shell.compose(state.reported_size.0, state.reported_size.1)
+                            });
+                            if let Some(frame) = composed {
+                                state.present_frame(frame);
                             }
                         }
+                        crate::render_prof::duration_since(
+                            "client_surface_patch.total",
+                            patch_started,
+                        );
+                        crate::render_prof::flush_if_due();
                     }
-                    #[cfg(not(unix))]
-                    let _ = (
+                    ServerMessage::Terminal(frame) => {
+                        if state.kitty_graphics_enabled
+                            && contains_kitty_graphics_bytes(&frame.bytes)
+                        {
+                            record_received_kitty_graphics(&frame.bytes);
+                        }
+                        let mut stdout = io::stdout();
+                        let _ = stdout.write_all(&frame.bytes);
+                        let _ = stdout.flush();
+                    }
+                    ServerMessage::Graphics { bytes } => {
+                        if state.kitty_graphics_enabled {
+                            record_received_kitty_graphics(&bytes);
+                            let mut stdout = io::stdout();
+                            let _ = stdout.write_all(&bytes);
+                            let _ = stdout.flush();
+                        }
+                    }
+                    ServerMessage::TerminalBell { count } => {
+                        if let Err(err) =
+                            crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
+                        {
+                            warn!(err = %err, "failed to emit terminal bell");
+                        }
+                    }
+                    ServerMessage::GraphicsFile {
                         path,
                         expected_len,
                         image_id,
@@ -1444,322 +1255,591 @@ async fn run_client_loop(
                         leading,
                         control,
                         surface_asset,
-                    );
-                }
-                ServerMessage::GraphicsTransmissionRetired {
-                    transfer_id,
-                    image_id,
-                } => {
-                    #[cfg(unix)]
-                    {
-                        state.retired_direct_graphics = Some((transfer_id, image_id));
-                        state.pending_surface_graphics.remove(&transfer_id);
-                        let cleanup = state.shell.as_mut().map_or_else(Vec::new, |shell| {
-                            shell.retire_direct_graphics_image(image_id);
-                            shell
-                                .compose(state.reported_size.0, state.reported_size.1)
-                                .map(|frame| frame.graphics)
-                                .unwrap_or_else(|| shell.take_pending_graphics_cleanup())
-                        });
-                        state.present_graphics(&cleanup);
-                        if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                            matcher.retire(transfer_id);
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    let _ = (transfer_id, image_id);
-                }
-                ServerMessage::ServerShutdown { reason } => {
-                    return Err(ClientError::ServerShutdown { reason });
-                }
-                ServerMessage::Notify {
-                    kind,
-                    message,
-                    body,
-                } => {
-                    if state.shell.is_none() {
-                        handle_notify(kind, &message, body.as_deref(), &state.sound_config);
-                    }
-                }
-                ServerMessage::SemanticNotification(event) => {
-                    if state.shell.is_some() {
-                        let (effects, frame) = {
-                            let shell = state.shell.as_mut().expect("checked shell mode");
-                            let (effects, repaint) =
-                                shell.receive_notification(event, std::time::Instant::now());
-                            let frame = repaint
-                                .then(|| {
-                                    shell.compose(state.reported_size.0, state.reported_size.1)
+                    } => {
+                        #[cfg(unix)]
+                        {
+                            if state.retired_direct_graphics.take()
+                                == Some((endpoint_id.clone(), transfer_id, image_id))
+                            {
+                                continue;
+                            }
+                            let surface_asset_valid = match (state.shell.as_ref(), &surface_asset) {
+                                (Some(shell), Some(asset)) => {
+                                    crate::kitty_graphics::surface::host_image_id(
+                                        shell.graphics_scope(),
+                                        asset,
+                                    ) == image_id
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            };
+                            let valid = state.kitty_graphics_enabled
+                                && surface_asset_valid
+                                && usize::try_from(expected_len).ok().is_some_and(|len| {
+                                    crate::pane_graphics_files::validate_direct_source(
+                                        std::path::Path::new(&path),
+                                        len,
+                                    )
+                                    .is_ok()
+                                        && direct_graphics::valid_control(&control, image_id, len)
                                 })
-                                .flatten();
-                            (effects, frame)
-                        };
-                        handle_shell_notification_effects(effects, &state.sound_config);
-                        if let Some(frame) = frame {
-                            state.present_frame(frame);
+                                && state
+                                    .direct_graphics_response
+                                    .lock()
+                                    .is_ok_and(|mut matcher| matcher.arm(transfer_id, image_id));
+                            let sent = if valid {
+                                let mut command = Vec::new();
+                                crate::kitty_graphics::encode_kitty_regular_file(
+                                    &mut command,
+                                    &leading,
+                                    &control,
+                                    &path,
+                                );
+                                let mut stdout = io::stdout();
+                                let written = stdout
+                                    .write_all(&command)
+                                    .and_then(|()| stdout.flush())
+                                    .is_ok();
+                                if written {
+                                    record_received_kitty_graphics(&command);
+                                }
+                                written
+                            } else {
+                                false
+                            };
+                            if sent {
+                                if let Some(asset) = surface_asset {
+                                    state.pending_surface_graphics.insert(
+                                        (endpoint_id.clone(), transfer_id, image_id),
+                                        asset,
+                                    );
+                                }
+                                if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+                                    matcher.start(transfer_id);
+                                }
+                                let started = ClientMessage::GraphicsTransmissionStarted {
+                                    transfer_id,
+                                    image_id,
+                                };
+                                if let Err(err) = write_to_server(&mut write_stream, &started) {
+                                    return Err(ClientError::ConnectionLost(err));
+                                }
+                            } else {
+                                state.pending_surface_graphics.remove(&(
+                                    endpoint_id.clone(),
+                                    transfer_id,
+                                    image_id,
+                                ));
+                                if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+                                    if valid {
+                                        matcher.retire(transfer_id);
+                                    } else {
+                                        matcher.cancel(transfer_id);
+                                    }
+                                }
+                                let result = ClientMessage::GraphicsTransmissionResult {
+                                    transfer_id,
+                                    image_id,
+                                    success: false,
+                                };
+                                if let Err(err) = write_to_server(&mut write_stream, &result) {
+                                    return Err(ClientError::ConnectionLost(err));
+                                }
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        let _ = (
+                            path,
+                            expected_len,
+                            image_id,
+                            transfer_id,
+                            leading,
+                            control,
+                            surface_asset,
+                        );
+                    }
+                    ServerMessage::GraphicsTransmissionRetired {
+                        transfer_id,
+                        image_id,
+                    } => {
+                        #[cfg(unix)]
+                        {
+                            state.retired_direct_graphics =
+                                Some((endpoint_id.clone(), transfer_id, image_id));
+                            state.pending_surface_graphics.remove(&(
+                                endpoint_id.clone(),
+                                transfer_id,
+                                image_id,
+                            ));
+                            let cleanup = state.shell.as_mut().map_or_else(Vec::new, |shell| {
+                                shell.retire_direct_graphics_image(image_id);
+                                shell
+                                    .compose(state.reported_size.0, state.reported_size.1)
+                                    .map(|frame| frame.graphics)
+                                    .unwrap_or_else(|| shell.take_pending_graphics_cleanup())
+                            });
+                            state.present_graphics(&cleanup);
+                            if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+                                matcher.retire(transfer_id);
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        let _ = (transfer_id, image_id);
+                    }
+                    ServerMessage::ServerShutdown { reason } => {
+                        if endpoint_id.is_local() {
+                            return Err(ClientError::ServerShutdown { reason });
+                        }
+                        write_stream.disconnect(&endpoint_id);
+                        if handle_remote_endpoint_disconnect(
+                            &mut state,
+                            &mut write_stream,
+                            &mut endpoint_commands,
+                            &mut ssh_supervisors,
+                            &mut pending_activation,
+                            &endpoint_id,
+                            now,
+                            "server stopped; reconnecting",
+                        ) {
+                            clear_endpoint_host_effects(
+                                &mut state,
+                                &host_mouse_capture_active,
+                                &host_sgr_pixels_active,
+                            );
                         }
                     }
-                }
-                ServerMessage::ClientShellError { message } => {
-                    if let Some(shell) = state.shell.as_mut() {
-                        if shell.receive_endpoint_error(message) {
-                            let frame = shell.compose(state.reported_size.0, state.reported_size.1);
+                    ServerMessage::Notify {
+                        kind,
+                        message,
+                        body,
+                    } => {
+                        if state.shell.is_none() {
+                            handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                        }
+                    }
+                    ServerMessage::SemanticNotification(event) => {
+                        if state.shell.is_some() {
+                            let (effects, frame) = {
+                                let shell = state.shell.as_mut().expect("checked shell mode");
+                                let (effects, repaint) = shell.receive_notification(
+                                    &endpoint_id,
+                                    event,
+                                    std::time::Instant::now(),
+                                );
+                                let frame = repaint
+                                    .then(|| {
+                                        shell.compose(state.reported_size.0, state.reported_size.1)
+                                    })
+                                    .flatten();
+                                (effects, frame)
+                            };
+                            handle_shell_notification_effects(effects, &state.sound_config);
                             if let Some(frame) = frame {
                                 state.present_frame(frame);
                             }
                         }
                     }
-                }
-                ServerMessage::ClientShellEndpointResponseChunk {
-                    boot_id,
-                    request_id,
-                    final_chunk,
-                    data,
-                } => {
-                    let completed = endpoint_commands
-                        .receive_chunk(&boot_id, &request_id, final_chunk, data)
-                        .map_err(ClientError::ConnectionLost)?;
-                    let Some(completed) = completed else {
-                        continue;
-                    };
-                    let (repaint, actions) = state.shell.as_mut().map_or_else(
-                        || (false, Vec::new()),
-                        |shell| {
-                            shell.handle_endpoint_result(
-                                &completed.boot_id,
-                                &completed.request_id,
-                                completed.result,
-                            )
-                        },
-                    );
-                    if let Some(shell) = state.shell.as_mut() {
-                        shell.reconcile_input_source();
+                    ServerMessage::ClientShellError { message } => {
+                        if let Some(shell) = state.shell.as_mut() {
+                            if shell.receive_endpoint_error(message) {
+                                let frame =
+                                    shell.compose(state.reported_size.0, state.reported_size.1);
+                                if let Some(frame) = frame {
+                                    state.present_frame(frame);
+                                }
+                            }
+                        }
                     }
-                    apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
-                    let replay_mouse = dispatch_client_shell_actions(
-                        actions,
-                        &mut endpoint_commands,
-                        &mut write_stream,
-                        &mut state.detached_process_children,
-                    )?;
-                    if replay_mouse.is_empty() {
-                        if repaint {
-                            if let Some(frame) = state.shell.as_mut().and_then(|shell| {
-                                shell.compose(state.reported_size.0, state.reported_size.1)
-                            }) {
+                    ServerMessage::ClientShellEndpointResponseChunk {
+                        boot_id,
+                        request_id,
+                        final_chunk,
+                        data,
+                    } => {
+                        if pending_activation.as_ref().is_some_and(|pending| {
+                            pending.accepts_response(
+                                &endpoint_id,
+                                generation,
+                                &boot_id,
+                                &request_id,
+                            )
+                        }) {
+                            if !final_chunk {
+                                rollback_endpoint_activation(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut pending_activation,
+                                    "endpoint returned a chunked activation acknowledgement".into(),
+                                    false,
+                                );
+                                continue;
+                            }
+                            let progress = pending_activation.as_mut().map(|pending| {
+                                pending.receive_response_for_boot(
+                                    &endpoint_id,
+                                    generation,
+                                    &boot_id,
+                                    &request_id,
+                                    &data,
+                                    &mut write_stream,
+                                )
+                            });
+                            match progress {
+                                Some(endpoint::SurfaceActivationProgress::Ready) => {
+                                    if let Some(event) = complete_endpoint_activation(
+                                        &mut state,
+                                        &mut write_stream,
+                                        &mut pending_activation,
+                                        &mut endpoint_commands,
+                                    )? {
+                                        scheduled_activation = Some(event);
+                                    }
+                                }
+                                Some(endpoint::SurfaceActivationProgress::Rejected {
+                                    message,
+                                    source_release_rejected,
+                                }) => {
+                                    rollback_endpoint_activation(
+                                        &mut state,
+                                        &mut write_stream,
+                                        &mut pending_activation,
+                                        message,
+                                        source_release_rejected,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        if request_id.starts_with("client-shell-surface:") {
+                            continue;
+                        }
+                        let completed = endpoint_commands
+                            .receive_chunk(
+                                &endpoint_id,
+                                generation,
+                                &boot_id,
+                                &request_id,
+                                final_chunk,
+                                data,
+                            )
+                            .map_err(ClientError::ConnectionLost)?;
+                        let Some(completed) = completed else {
+                            continue;
+                        };
+                        let (repaint, actions) = state.shell.as_mut().map_or_else(
+                            || (false, Vec::new()),
+                            |shell| {
+                                if completed.generation == generation
+                                    && shell.endpoint_is_active(&completed.endpoint_id)
+                                {
+                                    shell.handle_endpoint_result(
+                                        &completed.boot_id,
+                                        &completed.request_id,
+                                        completed.result,
+                                    )
+                                } else {
+                                    shell.discard_endpoint_result(&completed.request_id);
+                                    (false, Vec::new())
+                                }
+                            },
+                        );
+                        if let Some(shell) = state.shell.as_mut() {
+                            shell.reconcile_input_source();
+                        }
+                        apply_client_shell_input_source_changes(
+                            &mut state,
+                            &mut prefix_input_source,
+                        );
+                        let replay_mouse = dispatch_client_shell_actions(
+                            actions,
+                            &mut endpoint_commands,
+                            &mut write_stream,
+                            &mut state.detached_process_children,
+                            &event_tx,
+                        )?;
+                        if replay_mouse.is_empty() {
+                            if repaint {
+                                if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                                    shell.compose(state.reported_size.0, state.reported_size.1)
+                                }) {
+                                    state.present_frame(frame);
+                                }
+                            }
+                        } else {
+                            let (outcome, frame) = {
+                                let shell = state.shell.as_mut().expect("shell endpoint response");
+                                let mut outcome = shell.replay_mouse_events(replay_mouse);
+                                outcome.repaint |= repaint;
+                                let frame = outcome
+                                    .repaint
+                                    .then(|| {
+                                        shell.compose(state.reported_size.0, state.reported_size.1)
+                                    })
+                                    .flatten();
+                                (outcome, frame)
+                            };
+                            if finish_client_shell_input(
+                                &mut state,
+                                outcome,
+                                frame,
+                                &mut write_stream,
+                                &mut pending_activation,
+                                &mut endpoint_commands,
+                                &mut prefix_input_source,
+                                &event_tx,
+                            )? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    ServerMessage::Clipboard { data } => {
+                        if forward_clipboard(&data) {
+                            let (width, height) = state.reported_size;
+                            let frame = state.shell.as_mut().and_then(|shell| {
+                                shell
+                                    .show_copy_feedback(std::time::Instant::now())
+                                    .then(|| shell.compose(width, height))
+                                    .flatten()
+                            });
+                            if let Some(frame) = frame {
                                 state.present_frame(frame);
                             }
                         }
-                    } else {
-                        let (outcome, frame) = {
-                            let shell = state.shell.as_mut().expect("shell endpoint response");
-                            let mut outcome = shell.replay_mouse_events(replay_mouse);
-                            outcome.repaint |= repaint;
-                            let frame = outcome
-                                .repaint
-                                .then(|| {
-                                    shell.compose(state.reported_size.0, state.reported_size.1)
-                                })
-                                .flatten();
-                            (outcome, frame)
-                        };
-                        if finish_client_shell_input(
-                            &mut state,
-                            outcome,
-                            frame,
-                            &mut write_stream,
-                            &mut endpoint_commands,
-                            &mut prefix_input_source,
-                        )? {
-                            return Ok(());
-                        }
+                        let _ = io::stdout().flush();
                     }
-                }
-                ServerMessage::Clipboard { data } => {
-                    if forward_clipboard(&data) {
-                        let (width, height) = state.reported_size;
-                        let frame = state.shell.as_mut().and_then(|shell| {
-                            shell
-                                .show_copy_feedback(std::time::Instant::now())
-                                .then(|| shell.compose(width, height))
-                                .flatten()
-                        });
-                        if let Some(frame) = frame {
-                            state.present_frame(frame);
-                        }
-                    }
-                    let _ = io::stdout().flush();
-                }
-                ServerMessage::WindowTitle { title } => {
-                    let _ = crate::terminal_effects::write_window_title(
-                        &mut io::stdout(),
-                        title.as_deref(),
-                    );
-                }
-                ServerMessage::ReloadSoundConfig => {
-                    let previous_mouse_capture = state.shell_mouse_capture_preference;
-                    let mut mouse_capture = previous_mouse_capture;
-                    reload_local_client_config(
-                        &mut state.sound_config,
-                        &mut state.redraw_on_focus_gained,
-                        &mut state.draw_host_cursor,
-                        &mut state.remote_image_paste_key,
-                        &mut mouse_capture,
-                    );
-                    state.shell_mouse_capture_preference = mouse_capture;
-                    state.direct_mouse_capture_preference =
-                        state.attach_escape.is_some() && mouse_capture;
-                    if state.shell.is_some() && previous_mouse_capture != mouse_capture {
-                        write_to_server(
-                            &mut write_stream,
-                            &ClientMessage::ClientShellMouseCapture {
-                                enabled: mouse_capture,
-                            },
-                        )
-                        .map_err(ClientError::ConnectionLost)?;
-                    }
-                    if state.attach_escape.is_some() {
-                        let enabled = effective_mouse_capture(
-                            state.endpoint_mouse_capture_requested,
-                            state.direct_mouse_capture_preference,
+                    ServerMessage::WindowTitle { title } => {
+                        let _ = crate::terminal_effects::write_window_title(
+                            &mut io::stdout(),
+                            title.as_deref(),
                         );
-                        let sgr_pixels = effective_sgr_pixel_mouse(
+                    }
+                    ServerMessage::ReloadSoundConfig => apply_reload(
+                        &mut state,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        &host_mouse_capture_active,
+                        &host_sgr_pixels_active,
+                        &mut prefix_input_source,
+                    )?,
+                    ServerMessage::MouseCapture {
+                        enabled,
+                        sgr_pixels,
+                    } => {
+                        state.endpoint_mouse_capture_requested = enabled;
+                        state.endpoint_sgr_pixels_requested = sgr_pixels;
+                        let enabled =
+                            effective_mouse_capture(enabled, state.direct_mouse_capture_preference);
+                        let next_sgr_pixels = effective_sgr_pixel_mouse(
                             enabled,
-                            state.endpoint_sgr_pixels_requested,
+                            sgr_pixels,
                             state.pixel_geometry_exact,
                         );
-                        if enabled != state.mouse_capture_active
-                            || sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire)
-                        {
-                            set_mouse_capture(enabled, sgr_pixels)
+                        let mouse_mode_changed = enabled != state.mouse_capture_active
+                            || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
+                        if mouse_mode_changed {
+                            #[cfg(windows)]
+                            if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
+                                let _ = enable_windows_virtual_terminal_input();
+                            }
+                            set_mouse_capture(enabled, next_sgr_pixels)
                                 .map_err(ClientError::ConnectionFailed)?;
+                            #[cfg(windows)]
+                            if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
+                                let _ = enable_windows_virtual_terminal_input();
+                            }
                         }
                         state.mouse_capture_active = enabled;
                         host_mouse_capture_active.store(enabled, Ordering::Release);
-                        host_sgr_pixels_active.store(sgr_pixels, Ordering::Release);
+                        host_sgr_pixels_active.store(next_sgr_pixels, Ordering::Release);
                     }
-                    let (frame, resize) = if let Some(shell) = state.shell.as_mut() {
-                        let previous_size =
-                            shell.surface_size(state.reported_size.0, state.reported_size.1);
-                        shell.reload_client_config();
-                        let next_size =
-                            shell.surface_size(state.reported_size.0, state.reported_size.1);
-                        let resize = (previous_size != next_size).then(|| {
-                            shell.invalidate_pane_surface();
-                            client_shell_resize_message(
-                                shell,
-                                state.reported_size.0,
-                                state.reported_size.1,
-                                state.reported_cell_size.0,
-                                state.reported_cell_size.1,
-                                state.pixel_geometry_exact,
+                    ServerMessage::DirectTerminalKeyboardProtocol {
+                        flags,
+                        modify_other_keys_level,
+                    } => {
+                        if state.attach_escape.is_some() {
+                            crate::terminal_modes::set_direct_host_keyboard_protocol(
+                                &mut io::stdout(),
+                                &mut state.direct_keyboard_protocol,
+                                flags,
+                                modify_other_keys_level,
                             )
-                        });
-                        (
-                            shell.compose(state.reported_size.0, state.reported_size.1),
-                            resize,
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
-                    if let Some(resize) = resize {
-                        write_to_server(&mut write_stream, &resize)
-                            .map_err(ClientError::ConnectionLost)?;
-                    }
-                    if let Some(frame) = frame {
-                        state.present_frame(frame);
-                    }
-                }
-                ServerMessage::MouseCapture {
-                    enabled,
-                    sgr_pixels,
-                } => {
-                    state.endpoint_mouse_capture_requested = enabled;
-                    state.endpoint_sgr_pixels_requested = sgr_pixels;
-                    let enabled =
-                        effective_mouse_capture(enabled, state.direct_mouse_capture_preference);
-                    let next_sgr_pixels =
-                        effective_sgr_pixel_mouse(enabled, sgr_pixels, state.pixel_geometry_exact);
-                    let mouse_mode_changed = enabled != state.mouse_capture_active
-                        || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
-                    if mouse_mode_changed {
-                        #[cfg(windows)]
-                        if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
-                            let _ = enable_windows_virtual_terminal_input();
-                        }
-                        set_mouse_capture(enabled, next_sgr_pixels)
                             .map_err(ClientError::ConnectionFailed)?;
-                        #[cfg(windows)]
-                        if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
-                            let _ = enable_windows_virtual_terminal_input();
                         }
                     }
-                    state.mouse_capture_active = enabled;
-                    host_mouse_capture_active.store(enabled, Ordering::Release);
-                    host_sgr_pixels_active.store(next_sgr_pixels, Ordering::Release);
-                }
-                ServerMessage::DirectTerminalKeyboardProtocol {
-                    flags,
-                    modify_other_keys_level,
-                } => {
-                    if state.attach_escape.is_some() {
-                        crate::terminal_modes::set_direct_host_keyboard_protocol(
-                            &mut io::stdout(),
-                            &mut state.direct_keyboard_protocol,
-                            flags,
-                            modify_other_keys_level,
-                        )
-                        .map_err(ClientError::ConnectionFailed)?;
-                    }
-                }
-                ServerMessage::ClientShellKeyboardReportAll { enabled } => {
-                    if state.shell.is_some() {
-                        state.pane_keyboard_report_all = enabled;
-                        sync_client_shell_keyboard_report_all(&mut state)?;
-                    }
-                }
-                ServerMessage::EndpointControl { kind, data } => {
-                    if kind != crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND {
-                        if kind.starts_with("shell.snapshot.") {
-                            return Err(ClientError::Protocol(protocol::FramingError::Io(
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "unsupported mandatory endpoint snapshot codec {kind:?}"
-                                    ),
-                                ),
-                            )));
+                    ServerMessage::ClientShellKeyboardReportAll { enabled } => {
+                        if state.shell.is_some() {
+                            state.pane_keyboard_report_all = enabled;
+                            sync_client_shell_keyboard_report_all(&mut state)?;
                         }
-                        debug!(%kind, "ignoring unknown endpoint control message");
-                        continue;
                     }
-                    let snapshot: crate::protocol::ClientShellSnapshot =
-                        serde_json::from_str(&data).map_err(|error| {
-                            ClientError::Protocol(protocol::FramingError::Io(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid endpoint snapshot: {error}"),
-                            )))
-                        })?;
-                    install_client_shell_snapshot(
+                    ServerMessage::EndpointControl { kind, data } => {
+                        if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_READY_KIND {
+                            let progress = pending_activation.as_mut().map(|activation| {
+                                activation.receive_presentation_effects_ready(
+                                    &endpoint_id,
+                                    generation,
+                                    &data,
+                                )
+                            });
+                            if matches!(progress, Some(endpoint::SurfaceActivationProgress::Ready))
+                            {
+                                if let Some(event) = complete_endpoint_activation(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut pending_activation,
+                                    &mut endpoint_commands,
+                                )? {
+                                    scheduled_activation = Some(event);
+                                }
+                            }
+                            continue;
+                        }
+                        let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
+                            Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
+                            Ok(endpoint::EndpointControlMessage::Ignored) => {
+                                debug!(%kind, "ignoring unknown endpoint control message");
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::Snapshot(snapshot)) => snapshot,
+                            Err(message) if !endpoint::protocol_failure_is_fatal(&endpoint_id) => {
+                                if handle_remote_endpoint_attention(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut endpoint_commands,
+                                    &mut ssh_supervisors,
+                                    &mut pending_activation,
+                                    &endpoint_id,
+                                    generation,
+                                    now,
+                                    message,
+                                ) {
+                                    clear_endpoint_host_effects(
+                                        &mut state,
+                                        &host_mouse_capture_active,
+                                        &host_sgr_pixels_active,
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(message) => {
+                                return Err(ClientError::Protocol(protocol::FramingError::Io(
+                                    io::Error::new(io::ErrorKind::InvalidData, message),
+                                )));
+                            }
+                        };
+                        let projection_pending = activation_message;
+                        let activation_progress = activation_message
+                            .then(|| {
+                                pending_activation.as_mut().map(|pending| {
+                                    pending.receive_snapshot(&endpoint_id, generation, &snapshot)
+                                })
+                            })
+                            .flatten();
+                        install_client_shell_snapshot(
+                            &mut state,
+                            &endpoint_id,
+                            snapshot,
+                            projection_pending,
+                            &mut write_stream,
+                            &mut prefix_input_source,
+                        )?;
+                        if matches!(
+                            activation_progress,
+                            Some(endpoint::SurfaceActivationProgress::Ready)
+                        ) {
+                            if let Some(event) = complete_endpoint_activation(
+                                &mut state,
+                                &mut write_stream,
+                                &mut pending_activation,
+                                &mut endpoint_commands,
+                            )? {
+                                scheduled_activation = Some(event);
+                            }
+                        }
+                        write_stream.mark_ready(&endpoint_id, generation);
+                        let selected_endpoint = endpoint_catalog
+                            .selected_profile
+                            .as_ref()
+                            .map_or(endpoint::ClientEndpointId::Local, |profile_id| {
+                                endpoint::ClientEndpointId::Ssh(profile_id.clone())
+                            });
+                        let activation_ready = state.shell.as_ref().is_some_and(|shell| {
+                            shell.endpoint_has_snapshot(&selected_endpoint)
+                                && shell.endpoint_boot_id(write_stream.active_id()).is_some()
+                        });
+                        let needs_surface = write_stream
+                            .connection(&selected_endpoint)
+                            .is_some_and(|connection| !connection.surface_active);
+                        if activation_ready && needs_surface && pending_activation.is_none() {
+                            scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
+                                endpoint_id: selected_endpoint,
+                                target: None,
+                                force: false,
+                            });
+                        }
+                    }
+                    ServerMessage::Welcome { .. } => {
+                        debug!("received unexpected Welcome in main loop");
+                    }
+                }
+            }
+            ClientLoopEvent::ServerDisconnected {
+                endpoint_id,
+                generation,
+            } => {
+                if !write_stream.accepts(&endpoint_id, generation) {
+                    continue;
+                }
+                write_stream.disconnect(&endpoint_id);
+                if endpoint_id.is_local() {
+                    #[cfg(unix)]
+                    state.retire_endpoint_graphics(&endpoint_id);
+                    return Err(ClientError::ConnectionLost(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "local server closed connection",
+                    )));
+                }
+                if handle_remote_endpoint_disconnect(
+                    &mut state,
+                    &mut write_stream,
+                    &mut endpoint_commands,
+                    &mut ssh_supervisors,
+                    &mut pending_activation,
+                    &endpoint_id,
+                    now,
+                    "connection was lost; reconnecting",
+                ) {
+                    clear_endpoint_host_effects(
                         &mut state,
-                        Box::new(snapshot),
-                        &mut write_stream,
-                        &mut prefix_input_source,
-                    )?;
+                        &host_mouse_capture_active,
+                        &host_sgr_pixels_active,
+                    );
                 }
-                ServerMessage::Welcome { .. } => {
-                    debug!("received unexpected Welcome in main loop");
-                }
-            },
-            ClientLoopEvent::ServerDisconnected => {
-                return Err(ClientError::ConnectionLost(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed connection",
-                )));
             }
             ClientLoopEvent::Timer => {
                 client_timer.fired();
+                if pending_activation
+                    .as_ref()
+                    .is_some_and(|activation| activation.expired(now))
+                {
+                    let endpoint_id = pending_activation
+                        .as_ref()
+                        .map(|activation| activation.target().clone())
+                        .expect("checked pending activation");
+                    let label = state
+                        .shell
+                        .as_ref()
+                        .map(|shell| shell.endpoint_label(&endpoint_id).to_owned())
+                        .unwrap_or_else(|| "Endpoint".into());
+                    rollback_endpoint_activation(
+                        &mut state,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        format!("{label} did not produce a coherent surface in time"),
+                        false,
+                    );
+                }
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
@@ -1767,12 +1847,58 @@ async fn run_client_loop(
                 state
                     .detached_process_children
                     .retain_mut(|child| child.try_wait().ok().flatten().is_none());
+                write_stream.tick_health(now);
+                for failure in write_stream.take_failures() {
+                    if write_stream.connection(&failure.endpoint_id).is_some()
+                        && !write_stream.accepts(&failure.endpoint_id, failure.generation)
+                    {
+                        continue;
+                    }
+                    warn!(
+                        endpoint = %failure.endpoint_id.storage_key(),
+                        error = %failure.message,
+                        "endpoint transport failed"
+                    );
+                    if failure.endpoint_id.is_local() {
+                        return Err(ClientError::ConnectionLost(io::Error::new(
+                            failure.kind,
+                            failure.message,
+                        )));
+                    }
+                    if failure.kind != io::ErrorKind::WouldBlock
+                        && handle_remote_endpoint_disconnect(
+                            &mut state,
+                            &mut write_stream,
+                            &mut endpoint_commands,
+                            &mut ssh_supervisors,
+                            &mut pending_activation,
+                            &failure.endpoint_id,
+                            now,
+                            "connection was lost; reconnecting",
+                        )
+                    {
+                        clear_endpoint_host_effects(
+                            &mut state,
+                            &host_mouse_capture_active,
+                            &host_sgr_pixels_active,
+                        );
+                    }
+                }
                 if state.shell.is_some() {
-                    let expired_endpoint = endpoint_commands.expire(now);
+                    let expired_endpoints = endpoint_commands
+                        .expire(now)
+                        .into_iter()
+                        .filter(|expired| {
+                            write_stream.accepts(&expired.endpoint_id, expired.generation)
+                        })
+                        .collect::<Vec<_>>();
                     let (effects, outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
                         let mut outcome = shell.tick_selection_autoscroll(now);
-                        if let Some(expired) = expired_endpoint {
+                        for expired in expired_endpoints {
+                            if !shell.endpoint_is_active(&expired.endpoint_id) {
+                                continue;
+                            }
                             let (repaint, actions) = shell.handle_endpoint_result(
                                 &expired.boot_id,
                                 &expired.request_id,
@@ -1795,8 +1921,10 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
+                        &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
+                        &event_tx,
                     )? {
                         return Ok(());
                     }
@@ -1812,142 +1940,6 @@ async fn run_client_loop(
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Server reader thread
-// ---------------------------------------------------------------------------
-
-/// Blocking thread that reads ServerMessages from the server and sends them
-/// to the main event loop.
-fn server_reader_thread(
-    mut stream: LocalStream,
-    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    should_quit: &Arc<AtomicBool>,
-    max_frame_size: usize,
-) {
-    // Ensure the read stream is in blocking mode to avoid WouldBlock errors
-    // from read_exact inside read_message. The stream should already be
-    // blocking after handshake, but we enforce it here as a safety measure.
-    if stream.set_nonblocking(false).is_err() {
-        // If we can't set blocking mode, the stream is likely broken.
-        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
-        return;
-    }
-
-    loop {
-        if should_quit.load(Ordering::Acquire) {
-            break;
-        }
-
-        match protocol::read_message(&mut stream, max_frame_size) {
-            Ok(msg) => {
-                if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage(Box::new(msg)))
-                    .is_err()
-                {
-                    break; // Main loop gone.
-                }
-            }
-            Err(protocol::FramingError::UnexpectedEof) => {
-                // Server closed connection.
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
-                break;
-            }
-            Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
-                // Should not happen with blocking mode, but handle gracefully
-                // in case the stream was set nonblocking by another clone.
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            Err(err) => {
-                warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
-                break;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Write helper
-// ---------------------------------------------------------------------------
-
-/// Writes a message to the server stream (blocking).
-fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<()> {
-    protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
-}
-
-// ---------------------------------------------------------------------------
-// Notifications
-// ---------------------------------------------------------------------------
-
-fn reload_local_client_config(
-    sound_config: &mut crate::config::SoundConfig,
-    redraw_on_focus_gained: &mut bool,
-    draw_host_cursor: &mut bool,
-    remote_image_paste_key: &mut Option<(
-        crossterm::event::KeyCode,
-        crossterm::event::KeyModifiers,
-    )>,
-    mouse_capture: &mut bool,
-) {
-    match crate::config::load_live_config() {
-        Ok(loaded) => {
-            let invalid_section = |section: &str| {
-                loaded
-                    .invalid_sections
-                    .iter()
-                    .any(|invalid| invalid == section)
-            };
-            if !invalid_section("ui") && loaded.config.invalid_sidebar_bounds_diagnostic().is_none()
-            {
-                for diagnostic in loaded.config.ui.sound.diagnostics() {
-                    warn!(diagnostic = %diagnostic, "local sound config diagnostic");
-                }
-                *sound_config = loaded.config.ui.sound.clone();
-                *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
-                *draw_host_cursor = should_draw_host_cursor(loaded.config.ui.host_cursor);
-                *mouse_capture = loaded.config.ui.mouse_capture;
-            }
-            if !invalid_section("keys") {
-                *remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
-            }
-            debug!("reloaded local client config");
-        }
-        Err(diagnostics) => {
-            warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Clipboard forwarding
-// ---------------------------------------------------------------------------
-
-/// Decode a clipboard payload forwarded by the server.
-fn decode_clipboard_payload(data: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(data).ok()
-}
-
-/// Forwards a clipboard write from the server to the local client clipboard.
-fn forward_clipboard(data: &str) -> bool {
-    let Some(bytes) = decode_clipboard_payload(data) else {
-        warn!("received invalid clipboard payload from server");
-        return false;
-    };
-
-    crate::selection::write_osc52_bytes(&bytes);
-    true
-}
-
-fn init_logging() {
-    crate::logging::init_file_logging("herdr-client.log");
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests;

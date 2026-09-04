@@ -147,6 +147,9 @@ impl ClientShellState {
                     }
                     return;
                 }
+                if self.handle_endpoint_navigation(action, outcome) {
+                    return;
+                }
                 if let Some(method) = self.endpoint_method_for_action(action) {
                     self.push_endpoint_method(method, outcome);
                     return;
@@ -408,7 +411,9 @@ impl ClientShellState {
         kind: PendingEndpointKind,
         outcome: &mut ClientShellInput,
     ) -> bool {
-        if self.snapshot.is_none() {
+        if !self.endpoint_is_online(&self.active_endpoint_id) {
+            let label = self.active_endpoint_label().to_owned();
+            outcome.repaint |= self.receive_endpoint_unavailable(format!("{label} is not ready"));
             return false;
         }
         let method_name = crate::api::api_method_name(&method).to_owned();
@@ -423,7 +428,9 @@ impl ClientShellState {
             );
             return false;
         }
-        let snapshot = self.snapshot.as_deref().expect("checked snapshot");
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return false;
+        };
         let confirmation_workspace_id = match &method {
             crate::api::schema::Method::TabClose(target) => snapshot
                 .tabs
@@ -450,6 +457,7 @@ impl ClientShellState {
             },
         );
         outcome.actions.push(ClientShellAction::Endpoint {
+            endpoint_id: self.active_endpoint_id.clone(),
             boot_id: snapshot.boot_id.clone(),
             request: Box::new(crate::api::schema::Request {
                 id: request_id,
@@ -466,6 +474,41 @@ impl ClientShellState {
             "Paste rejected",
             message,
         )
+    }
+
+    pub(crate) fn receive_endpoint_unavailable(&mut self, message: String) -> bool {
+        self.push_endpoint_notice(
+            ClientEndpointNoticeKind::Unavailable,
+            message.clone(),
+            "Endpoint unavailable",
+            message,
+        )
+    }
+
+    pub(crate) fn focus_endpoint_target(
+        &mut self,
+        target: ClientEndpointFocusTarget,
+    ) -> Vec<ClientShellAction> {
+        let method = match target {
+            ClientEndpointFocusTarget::Workspace(workspace_id) => {
+                crate::api::schema::Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+                    workspace_id,
+                })
+            }
+            ClientEndpointFocusTarget::Tab(tab_id) => {
+                crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget { tab_id })
+            }
+            ClientEndpointFocusTarget::Pane(pane_id) => {
+                crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget { pane_id })
+            }
+        };
+        let mut outcome = ClientShellInput::default();
+        self.push_endpoint_method(method, &mut outcome);
+        outcome.actions
+    }
+
+    pub(crate) fn discard_endpoint_result(&mut self, request_id: &str) {
+        self.pending_requests.remove(request_id);
     }
 
     pub(crate) fn handle_endpoint_result(

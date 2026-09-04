@@ -6,7 +6,8 @@ fn receive_render(receiver: &std::sync::mpsc::Receiver<Vec<u8>>, timeout: Durati
 
 #[tokio::test]
 async fn client_shell_surface_sends_complete_placements_and_each_live_asset_once() {
-    let (mut server, client_rx, pane_id) = retained_test_server(b"client shell graphics");
+    let (mut server, _control_rx, client_rx, pane_id) =
+        retained_test_server_with_control(b"client shell graphics");
     let client = server.clients.get_mut(&1).unwrap();
     client.mode = ClientConnectionMode::ClientShell;
     client.render_state =
@@ -38,6 +39,19 @@ async fn client_shell_surface_sends_complete_placements_and_each_live_asset_once
     };
     assert_eq!(second.graphics.placements, first.graphics.placements);
     assert!(second.graphics.assets.is_empty());
+
+    // A post-commit typed surface.set(true) resets only this viewer's delivery cache, so the
+    // already selected target receives the asset again without relying on graphics that may have
+    // arrived during the frozen source frame.
+    assert!(server.set_client_shell_surface_active(1, true).is_some());
+    server.render_and_stream();
+    let replay = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(replay) = replay else {
+        panic!("expected post-commit graphics replay");
+    };
+    assert_eq!(replay.graphics.placements, first.graphics.placements);
+    assert_eq!(replay.graphics.assets.len(), 1);
+    assert_eq!(replay.graphics.assets[0].data, vec![1, 2, 3, 4]);
 }
 
 #[tokio::test]
