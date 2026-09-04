@@ -317,6 +317,42 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
     shutdown_test_runtimes(&mut server);
 }
 
+fn dispatch_lifecycle_messages(
+    server: &mut HeadlessServer,
+    client_id: u64,
+    messages: Vec<crate::protocol::ClientMessage>,
+) {
+    for message in messages {
+        let event = match message {
+            crate::protocol::ClientMessage::ClientShellResize {
+                cell_width_px,
+                cell_height_px,
+                surface_size,
+                pixel_mouse,
+            } => ServerEvent::ClientShellResize {
+                client_id,
+                cell_width_px,
+                cell_height_px,
+                surface_cols: surface_size.cols,
+                surface_rows: surface_size.rows,
+                pixel_mouse,
+            },
+            crate::protocol::ClientMessage::ClientShellFocus { focused } => {
+                ServerEvent::ClientShellFocus { client_id, focused }
+            }
+            crate::protocol::ClientMessage::ClientShellEndpointRequest { boot_id, request } => {
+                ServerEvent::ClientShellEndpointRequest {
+                    client_id,
+                    boot_id,
+                    request: Box::new(serde_json::from_str(&request).unwrap()),
+                }
+            }
+            other => panic!("unhandled lifecycle message: {other:?}"),
+        };
+        server.handle_server_event(event);
+    }
+}
+
 /// A real two-server/client lifecycle harness. Both source-off and target-on traverse the
 /// production HeadlessServer endpoint request path; the client test only routes its emitted wire
 /// messages and never authors an acknowledgement, snapshot, or surface response.
@@ -473,31 +509,18 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
         crate::client::endpoint::SurfaceActivationProgress::Pending
     );
 
-    // Dispatch the exact target-on request emitted after the real source-off acknowledgement.
-    let target_request = target_sent
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|message| match message {
-            crate::protocol::ClientMessage::ClientShellEndpointRequest { boot_id, request } => {
-                let request = serde_json::from_str::<api::schema::Request>(request).ok()?;
-                matches!(
-                    request.method,
-                    api::schema::Method::ClientShellSurfaceSet(
-                        api::schema::ClientShellSurfaceSetParams { active: true }
-                    )
-                )
-                .then(|| (boot_id.clone(), Box::new(request)))
-            }
-            _ => None,
-        })
-        .expect("client target-on request");
-    assert!(
-        target_server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
-            client_id: target_client_id,
-            boot_id: target_request.0,
-            request: target_request.1,
-        })
+    dispatch_lifecycle_messages(
+        &mut target_server,
+        target_client_id,
+        std::mem::take(&mut *target_sent.lock().unwrap()),
+    );
+    assert_eq!(
+        target_server.clients[&target_client_id].outer_terminal_focus,
+        Some(true)
+    );
+    assert_eq!(
+        source_server.clients[&source_client_id].outer_terminal_focus,
+        Some(false)
     );
     let ServerMessage::ClientShellEndpointResponseChunk {
         request_id, data, ..
@@ -657,6 +680,46 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
     assert_eq!(endpoints.active_id(), &target_id);
     assert!(endpoints.active_surface_available());
     assert!(shell.endpoint_is_active(&target_id));
+
+    target_sent.lock().unwrap().clear();
+    let mut returning = crate::client::endpoint::PendingEndpointActivation::begin(
+        &shell,
+        &mut endpoints,
+        ClientEndpointId::Local,
+        None,
+        lifecycle_resize(),
+        42,
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    dispatch_lifecycle_messages(
+        &mut target_server,
+        target_client_id,
+        std::mem::take(&mut *target_sent.lock().unwrap()),
+    );
+    loop {
+        if let ServerMessage::ClientShellEndpointResponseChunk {
+            request_id, data, ..
+        } = read_server_message(target_control.recv().unwrap())
+        {
+            returning.receive_response(&target_id, 7, &request_id, &data, &mut endpoints);
+            break;
+        }
+    }
+    dispatch_lifecycle_messages(
+        &mut source_server,
+        source_client_id,
+        std::mem::take(&mut *source_sent.lock().unwrap()),
+    );
+    assert_eq!(
+        source_server.clients[&source_client_id].outer_terminal_focus,
+        Some(true),
+        "returning to Local must restore focus without a host focus event"
+    );
+    assert_eq!(
+        target_server.clients[&target_client_id].outer_terminal_focus,
+        Some(false)
+    );
     shutdown_test_runtimes(&mut source_server);
     shutdown_test_runtimes(&mut target_server);
 }

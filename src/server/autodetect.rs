@@ -296,14 +296,23 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
     let socket_path = client_socket_path();
     info!(path = %socket_path.display(), "auto-detect launch starting");
 
-    if is_server_listening_at(&socket_path) {
-        validate_running_server_compatibility(saved_federation)?;
+    let startup = if is_server_listening_at(&socket_path) {
         info!("server already running, attaching as client");
+        if saved_federation {
+            Ok(())
+        } else {
+            validate_running_server_compatibility(false)
+        }
     } else {
         info!("no server running, spawning server daemon");
-        spawn_server_daemon()?;
-        wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT)?;
-        info!("server ready, attaching as client");
+        spawn_server_daemon()
+            .and_then(|_| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
+    };
+    if let Err(error) = startup {
+        if !saved_federation {
+            return Err(error);
+        }
+        tracing::warn!(%error, "Local startup failed; keeping saved machines available");
     }
 
     // Now attach as a thin client.

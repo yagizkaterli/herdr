@@ -10,6 +10,7 @@ mod health;
 mod message_policy;
 mod registry;
 mod supervisor;
+mod writer;
 
 pub(crate) use activation::*;
 pub(crate) use catalog::*;
@@ -17,6 +18,7 @@ pub(crate) use control::*;
 pub(crate) use message_policy::*;
 pub(crate) use registry::*;
 pub(crate) use supervisor::*;
+pub(crate) use writer::NativeEndpointTransport;
 
 const PROFILE_ID_BYTES: usize = 16;
 

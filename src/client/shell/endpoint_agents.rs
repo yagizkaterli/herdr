@@ -45,7 +45,7 @@ pub(super) fn render_collapsed(
 pub(super) fn render_expanded(
     buffer: &mut Buffer,
     area: Rect,
-    active_snapshot: &ClientShellSnapshot,
+    agent_view_label: Option<&str>,
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
@@ -55,7 +55,7 @@ pub(super) fn render_expanded(
     if !super::agent_sidebar::render_agent_panel_header(
         buffer,
         area,
-        active_snapshot.agent_view_label.as_deref(),
+        agent_view_label,
         config,
         hits,
     ) {
@@ -66,10 +66,7 @@ pub(super) fn render_expanded(
         buffer,
         area,
         &rows,
-        active_snapshot
-            .agent_view_label
-            .as_ref()
-            .map(|_| " no matching agents"),
+        agent_view_label.map(|_| " no matching agents"),
         config,
         agent_scroll,
         hits,

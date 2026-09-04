@@ -113,7 +113,11 @@ pub(super) fn clear_endpoint_host_effects(
 ) {
     state.endpoint_mouse_capture_requested = false;
     state.endpoint_sgr_pixels_requested = false;
-    let enabled = super::effective_mouse_capture(false, state.direct_mouse_capture_preference);
+    let enabled = if state.shell.is_some() {
+        state.shell_mouse_capture_preference
+    } else {
+        state.direct_mouse_capture_preference
+    };
     let sgr_pixels = super::effective_sgr_pixel_mouse(enabled, false, state.pixel_geometry_exact);
     if enabled != state.mouse_capture_active
         || sgr_pixels != host_sgr_pixels_active.load(std::sync::atomic::Ordering::Acquire)
@@ -420,18 +424,18 @@ pub(super) fn rollback_endpoint_activation(
     }
 }
 
-pub(super) fn handle_remote_endpoint_disconnect(
+pub(super) fn handle_endpoint_disconnect(
     state: &mut ClientState,
     endpoints: &mut endpoint::EndpointRegistry,
     endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    ssh_supervisors: &mut endpoint::SshSupervisors,
+    supervisors: &mut endpoint::EndpointSupervisors,
     pending_activation: &mut Option<endpoint::PendingEndpointActivation>,
     endpoint_id: &endpoint::ClientEndpointId,
+    generation: u64,
     now: std::time::Instant,
-    notice: &'static str,
+    notice: &str,
 ) -> bool {
-    debug_assert!(!endpoint_id.is_local());
-    ssh_supervisors.disconnected(endpoint_id, now);
+    supervisors.disconnected(endpoint_id, generation, now);
     #[cfg(unix)]
     state.retire_endpoint_graphics(endpoint_id);
     if pending_activation
@@ -475,20 +479,19 @@ pub(super) fn handle_remote_endpoint_disconnect(
     endpoint_was_active
 }
 
-pub(super) fn handle_remote_endpoint_attention(
+pub(super) fn handle_endpoint_attention(
     state: &mut ClientState,
     endpoints: &mut endpoint::EndpointRegistry,
     endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    ssh_supervisors: &mut endpoint::SshSupervisors,
+    supervisors: &mut endpoint::EndpointSupervisors,
     pending_activation: &mut Option<endpoint::PendingEndpointActivation>,
     endpoint_id: &endpoint::ClientEndpointId,
     generation: u64,
     now: std::time::Instant,
     message: String,
 ) -> bool {
-    debug_assert!(!endpoint_id.is_local());
     endpoints.disconnect(endpoint_id);
-    ssh_supervisors.record_status(
+    supervisors.record_status(
         endpoint_id,
         generation,
         endpoint::ClientEndpointStatus::Attention,
@@ -548,9 +551,11 @@ pub(super) fn install_client_shell_snapshot(
     let generation = connection.generation;
     let project_snapshot =
         !projection_pending && endpoints.active_id() == endpoint_id && connection.surface_active;
-    let waits_for_selected_surface =
-        projection_pending || (endpoints.active_id() == endpoint_id && !project_snapshot);
     let (composed, resize, graphics_cleanup) = if let Some(shell) = &mut state.shell {
+        let waits_for_selected_surface = projection_pending
+            || (endpoints.active_id() == endpoint_id
+                && !project_snapshot
+                && shell.has_presented_surface());
         let previous_size = shell.surface_size(state.reported_size.0, state.reported_size.1);
         if !waits_for_selected_surface {
             shell.set_endpoint_status(endpoint_id, endpoint::ClientEndpointStatus::Online);
@@ -589,7 +594,11 @@ pub(super) fn install_client_shell_snapshot(
         endpoints.send_to(endpoint_id, &resize);
     }
     if let Some(frame) = composed {
-        state.present_frame(frame);
+        if projection_pending {
+            state.present_frame(frame);
+        } else {
+            state.present_frozen_chrome(frame);
+        }
     }
     Ok(())
 }
@@ -698,7 +707,11 @@ pub(super) fn finish_client_shell_input(
         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
     }
     if let Some(frame) = frame {
-        state.present_frame(frame);
+        if pending_activation.is_some() {
+            state.present_frame(frame);
+        } else {
+            state.present_frozen_chrome(frame);
+        }
     }
     Ok(false)
 }

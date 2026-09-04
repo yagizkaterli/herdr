@@ -151,7 +151,7 @@ pub(super) fn render_collapsed(
 pub(super) fn render_expanded(
     buffer: &mut Buffer,
     area: Rect,
-    active_snapshot: &ClientShellSnapshot,
+    active_snapshot: Option<&ClientShellSnapshot>,
     config: &ClientShellConfig,
     state: &mut ShellRenderState<'_>,
     hits: &mut ShellHitMap,
@@ -353,7 +353,7 @@ pub(super) fn render_expanded(
             &label,
             Style::default().fg(palette.overlay0),
         );
-        let attention = super::global_menu::global_menu_attention(active_snapshot);
+        let attention = active_snapshot.is_some_and(super::global_menu::global_menu_attention);
         let width = if attention { 8 } else { 6 }.min(workspace_area.width);
         hits.global_launcher = Rect::new(
             workspace_area.right().saturating_sub(width),
@@ -376,7 +376,7 @@ pub(super) fn render_expanded(
     super::endpoint_agents::render_expanded(
         buffer,
         detail_area,
-        active_snapshot,
+        active_snapshot.and_then(|snapshot| snapshot.agent_view_label.as_deref()),
         state.endpoints,
         state.active_endpoint_id,
         config,

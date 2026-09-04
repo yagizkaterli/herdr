@@ -53,6 +53,64 @@ fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
 }
 
 #[test]
+fn machine_navigation_does_not_require_a_local_snapshot_or_surface() {
+    for (cols, rows) in [(100, 28), (36, 18)] {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let profile = remote_profile();
+        let remote = ClientEndpointId::Ssh(profile.id.clone());
+        state.set_endpoint_catalog(&[profile]);
+        state.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Reconnecting);
+        state.set_endpoint_status(&remote, ClientEndpointStatus::Online);
+        state.set_endpoint_snapshot(&remote, Box::new(snapshot()));
+        assert!(state.snapshot.is_none());
+        assert!(state.pane_surface.is_none());
+        let frame = state
+            .compose(cols, rows)
+            .expect("connection chrome without Local");
+        let local = state
+            .hits
+            .machines
+            .iter()
+            .find(|hit| hit.endpoint_id.is_local())
+            .unwrap()
+            .rect;
+        let buffer = frame.to_ratatui_buffer().unwrap();
+        let local_row = (local.x..local.right())
+            .map(|x| buffer[(x, local.y)].symbol())
+            .collect::<String>();
+        assert!(!local_row.contains("reconnecting"));
+        assert!(
+            !local_row.contains('◐'),
+            "Local never gets a connection badge"
+        );
+        let hit = state
+            .hits
+            .machines
+            .iter()
+            .find(|hit| hit.endpoint_id == remote)
+            .unwrap()
+            .rect;
+        let mut outcome = ClientShellInput::default();
+        state.handle_mouse(
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x + 5,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut outcome,
+        );
+        assert!(
+            matches!(outcome.actions.as_slice(), [ClientShellAction::ActivateEndpoint { endpoint_id, .. }] if endpoint_id == &remote)
+        );
+        assert!(
+            state.snapshot.is_none(),
+            "selection is committed only by coherent activation"
+        );
+    }
+}
+
+#[test]
 fn sidebar_renders_local_and_saved_ssh_endpoints_with_status() {
     let (mut state, _) = state_with_remote();
     let frame = state.compose(100, 28).expect("combined endpoint frame");

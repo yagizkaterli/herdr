@@ -127,9 +127,7 @@ use tracing::{debug, info, warn};
 
 use crate::ipc::LocalStream;
 use crate::protocol::render_ansi;
-use crate::protocol::{
-    self, ClientMessage, FrameData, ServerMessage, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
-};
+use crate::protocol::{self, ClientMessage, FrameData, ServerMessage, MAX_GRAPHICS_FRAME_SIZE};
 #[cfg(test)]
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
@@ -187,14 +185,26 @@ fn run_client_with_mode(
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
 
-    // Try to connect to the server.
-    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
-        Ok(s) => s,
-        Err(err) => {
-            // Server unreachable — show clear error and exit.
-            let client_err = ClientError::ConnectionFailed(err);
-            eprintln!("herdr: {client_err}");
-            std::process::exit(1);
+    let endpoint_catalog = if client_rendered_shell && !is_remote_client_process() {
+        endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
+            warn!(%error, "saved SSH endpoint catalog is unavailable");
+            endpoint::EndpointCatalog::default()
+        })
+    } else {
+        endpoint::EndpointCatalog::default()
+    };
+    let federated = endpoint_catalog.has_enabled_ssh();
+
+    let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
+        Ok(stream) => Some(stream),
+        Err(error) if federated => {
+            warn!(%error, "Local is unavailable; keeping saved machines available");
+            None
+        }
+        Err(error) => {
+            return Err(io::Error::other(
+                ClientError::ConnectionFailed(error).to_string(),
+            ));
         }
     };
 
@@ -206,39 +216,56 @@ fn run_client_with_mode(
         .shell_config
         .as_ref()
         .map(|shell| shell.initial_surface_size(cols, rows));
-    // Perform handshake while the stream is still in blocking mode.
-    let handshake = match do_handshake(
-        &mut stream,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        exact_cell_size,
-        shell_surface_size,
-        endpoint_keybindings,
-        loop_config.mouse_capture_active,
-        true,
-    ) {
-        Ok(encoding) => encoding,
-        Err(err) => {
-            eprintln!("herdr: {err}");
-            std::process::exit(1);
+    // Healthy Local attaches directly; only an actual failure enters background recovery.
+    let initial = initial_stream
+        .map(|mut stream| {
+            let handshake = do_handshake(
+                &mut stream,
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                exact_cell_size,
+                shell_surface_size,
+                endpoint_keybindings,
+                loop_config.mouse_capture_active,
+                true,
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+            if federated
+                && !endpoint::EndpointNegotiation::new(
+                    handshake.endpoint_methods.clone().unwrap_or_default(),
+                    handshake.endpoint_capabilities.clone().unwrap_or_default(),
+                )
+                .supports_surface_interest()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Local needs a server update before it can participate in multi-machine viewing",
+                ));
+            }
+            if let Some((terminal_id, takeover)) = attach_request {
+                write_to_server(
+                    &mut stream,
+                    &ClientMessage::AttachTerminal {
+                        terminal_id,
+                        takeover,
+                    },
+                )?;
+            }
+            Ok((stream, handshake))
+        })
+        .transpose();
+    let initial = match initial {
+        Ok(initial) => initial,
+        Err(error) if federated => {
+            warn!(%error, "Local handshake failed; keeping saved machines available");
+            None
         }
+        Err(error) => return Err(error),
     };
 
-    if let Some((terminal_id, takeover)) = attach_request {
-        let attach = ClientMessage::AttachTerminal {
-            terminal_id,
-            takeover,
-        };
-        if let Err(err) = write_to_server(&mut stream, &attach) {
-            eprintln!("herdr: failed to request terminal attach: {err}");
-            std::process::exit(1);
-        }
-    }
-
-    // Now set up the terminal. This must happen AFTER the handshake succeeds,
-    // so we don't leave the terminal in raw mode if the server rejects us.
+    // The federated shell can show connection notices without any server snapshot.
     let direct_attach = attach_escape.is_some();
     let terminal_guard = if direct_attach {
         setup_direct_attach_terminal(mouse_capture)
@@ -277,7 +304,8 @@ fn run_client_with_mode(
 
     let result = rt.block_on(async {
         run_client_loop(
-            stream,
+            initial,
+            endpoint_catalog,
             cols,
             rows,
             cell_width_px,
@@ -285,7 +313,6 @@ fn run_client_with_mode(
             exact_cell_size,
             should_quit,
             loop_config,
-            handshake,
             attach_escape,
         )
         .await
@@ -327,7 +354,8 @@ fn run_client_with_mode(
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
 async fn run_client_loop(
-    stream: LocalStream,
+    initial: Option<(LocalStream, handshake::HandshakeResult)>,
+    mut endpoint_catalog: endpoint::EndpointCatalog,
     cols: u16,
     rows: u16,
     initial_cell_width_px: u32,
@@ -335,13 +363,13 @@ async fn run_client_loop(
     initial_pixel_geometry_exact: bool,
     should_quit: Arc<AtomicBool>,
     config: ClientLoopConfig,
-    handshake: handshake::HandshakeResult,
     attach_escape: Option<AttachEscapeState>,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
     let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
     let is_remote_client = is_remote_client_process();
+    let local_unavailable = initial.is_none();
 
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
@@ -377,23 +405,23 @@ async fn run_client_loop(
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
-    let mut endpoint_catalog = if state.shell.is_some() && !is_remote_client {
-        endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
-            warn!(%error, "saved SSH endpoint catalog is unavailable");
-            endpoint::EndpointCatalog::default()
-        })
-    } else {
-        endpoint::EndpointCatalog::default()
-    };
+    let federated = endpoint_catalog.has_enabled_ssh();
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
         shell.set_endpoint_catalog(&endpoint_catalog.ssh);
         shell.set_endpoint_methods_for(
             &endpoint::ClientEndpointId::Local,
-            handshake.endpoint_methods.clone(),
+            initial
+                .as_ref()
+                .and_then(|(_, handshake)| handshake.endpoint_methods.clone()),
         );
+        if local_unavailable {
+            shell.set_endpoint_status(
+                &endpoint::ClientEndpointId::Local,
+                endpoint::ClientEndpointStatus::Connecting,
+            );
+        }
     }
-    debug!(encoding = ?handshake.encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
@@ -402,7 +430,8 @@ async fn run_client_loop(
 
     // Channel for events from the resize and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
-    let (ssh_tx, mut ssh_rx) = tokio::sync::mpsc::channel::<endpoint::SshSupervisorEvent>(64);
+    let (supervisor_tx, mut supervisor_rx) =
+        tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
     // Keep Windows console draining independent of server-frame backpressure.
     #[cfg(windows)]
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
@@ -459,7 +488,6 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     let resize_cell_size = reported_cell_size.clone();
-    let kitty_graphics_enabled = state.kitty_graphics_enabled;
     let pixel_geometry_enabled = state.pixel_geometry_enabled;
     let pixel_geometry_fallback = config.pixel_geometry_fallback;
     std::thread::spawn(move || {
@@ -477,46 +505,52 @@ async fn run_client_loop(
         );
     });
 
-    // Spawn the server reader thread (blocking reads from the socket).
-    // Clone the stream's file descriptor so we can read from a blocking stream.
-    let server_read_quit = should_quit.clone();
-    let server_read_tx = event_tx.clone();
-    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
+    let mut write_stream = if let Some((stream, handshake)) = initial {
+        let max_frame_size = if state.kitty_graphics_enabled {
             MAX_GRAPHICS_FRAME_SIZE
         } else {
-            MAX_FRAME_SIZE
+            crate::protocol::MAX_FRAME_SIZE
         };
-        server_reader_thread(
-            read_stream,
-            server_read_tx,
-            &server_read_quit,
-            max_frame_size,
+        let transport = start_endpoint_transport(
+            stream,
+            (),
+            &event_tx,
             endpoint::ClientEndpointId::Local,
             1,
+            max_frame_size,
+        )?;
+        let negotiation = endpoint::EndpointNegotiation::new(
+            handshake.endpoint_methods.unwrap_or_default(),
+            handshake.endpoint_capabilities.unwrap_or_default(),
         );
-    });
-
-    // Use the original stream for writing (blocking is fine since we write
-    // from the async loop).
-    stream
-        .set_nonblocking(false)
-        .map_err(ClientError::ConnectionFailed)?;
-    let local_negotiation = endpoint::EndpointNegotiation::new(
-        handshake.endpoint_methods.unwrap_or_default(),
-        handshake.endpoint_capabilities.unwrap_or_default(),
-    );
-    let mut write_stream = endpoint::EndpointRegistry::new(
-        endpoint::NativeEndpointTransport::new(stream),
-        1,
-        local_negotiation,
-    );
-    if state.shell.is_some() {
-        write_stream.send(&ClientMessage::ClientShellFocus { focused: true });
+        let mut registry = endpoint::EndpointRegistry::new(transport, 1, negotiation);
+        if state.shell.is_some() {
+            registry.send(&ClientMessage::ClientShellFocus { focused: true });
+        }
+        registry
+    } else {
+        endpoint::EndpointRegistry::empty()
+    };
+    let mut supervisors =
+        endpoint::EndpointSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
+    if federated {
+        supervisors.add_local(
+            client_socket_path(),
+            write_stream
+                .connection(&endpoint::ClientEndpointId::Local)
+                .map(|connection| connection.generation),
+            std::time::Instant::now(),
+        );
     }
-    let mut ssh_supervisors =
-        endpoint::SshSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
+    if local_unavailable {
+        if let Some(frame) = state
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.compose(cols, rows))
+        {
+            state.present_frame(frame);
+        }
+    }
     let mut next_surface_serial = 1_u64;
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
@@ -531,9 +565,9 @@ async fn run_client_loop(
     let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
         if let Some(shell) = state.shell.as_ref() {
-            ssh_supervisors.spawn_due(
+            supervisors.spawn_due(
                 std::time::Instant::now(),
-                endpoint::SshConnectOptions {
+                endpoint::EndpointConnectOptions {
                     cols: state.reported_size.0,
                     rows: state.reported_size.1,
                     cell_width_px: state.reported_cell_size.0,
@@ -543,7 +577,7 @@ async fn run_client_loop(
                     endpoint_keybindings: config.endpoint_keybindings,
                     mouse_capture: state.shell_mouse_capture_preference,
                 },
-                &ssh_tx,
+                &supervisor_tx,
             );
         }
         let timer_delay = state
@@ -568,7 +602,7 @@ async fn run_client_loop(
                     }
                 },
                 ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-                ev = ssh_rx.recv() => ev.map(ClientLoopEvent::SshSupervisor).unwrap_or(ClientLoopEvent::Timer),
+                ev = supervisor_rx.recv() => ev.map(ClientLoopEvent::EndpointSupervisor).unwrap_or(ClientLoopEvent::Timer),
             }
         };
         #[cfg(unix)]
@@ -578,7 +612,7 @@ async fn run_client_loop(
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
-                ev = ssh_rx.recv() => ev.map(ClientLoopEvent::SshSupervisor).unwrap_or(ClientLoopEvent::Timer),
+                ev = supervisor_rx.recv() => ev.map(ClientLoopEvent::EndpointSupervisor).unwrap_or(ClientLoopEvent::Timer),
                 ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
             }
         };
@@ -981,14 +1015,14 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::SshSupervisor(event) => match event {
-                endpoint::SshSupervisorEvent::Status {
+            ClientLoopEvent::EndpointSupervisor(event) => match event {
+                endpoint::EndpointSupervisorEvent::Status {
                     endpoint_id,
                     generation,
                     status,
                     message,
                 } => {
-                    if !ssh_supervisors.record_status(&endpoint_id, generation, status, now) {
+                    if !supervisors.record_status(&endpoint_id, generation, status, now) {
                         continue;
                     }
                     let unavailable = state.shell.as_mut().and_then(|shell| {
@@ -1005,14 +1039,14 @@ async fn run_client_loop(
                         state.present_frame(frame);
                     }
                 }
-                endpoint::SshSupervisorEvent::Connected {
+                endpoint::EndpointSupervisorEvent::Connected {
                     endpoint_id,
                     generation,
                     reader,
                     writer,
                     negotiation,
                 } => {
-                    if !ssh_supervisors.record_status(
+                    if !supervisors.record_status(
                         &endpoint_id,
                         generation,
                         endpoint::ClientEndpointStatus::Online,
@@ -1024,6 +1058,7 @@ async fn run_client_loop(
                         shell.set_endpoint_methods_for(&endpoint_id, Some(negotiation.methods()));
                         shell.compose(state.reported_size.0, state.reported_size.1)
                     });
+                    let reader_quit = writer.stop_handle();
                     write_stream.insert(
                         endpoint_id.clone(),
                         writer,
@@ -1035,7 +1070,6 @@ async fn run_client_loop(
                         state.present_frame(frame);
                     }
                     let reader_tx = event_tx.clone();
-                    let reader_quit = should_quit.clone();
                     std::thread::spawn(move || {
                         server_reader_thread(
                             reader,
@@ -1120,12 +1154,12 @@ async fn run_client_loop(
                 match *message {
                     ServerMessage::ClientShellSnapshot(_) => {
                         let message = "server sent an unnegotiated binary endpoint snapshot";
-                        if !endpoint_id.is_local() {
-                            if handle_remote_endpoint_attention(
+                        if federated || !endpoint_id.is_local() {
+                            if handle_endpoint_attention(
                                 &mut state,
                                 &mut write_stream,
                                 &mut endpoint_commands,
-                                &mut ssh_supervisors,
+                                &mut supervisors,
                                 &mut pending_activation,
                                 &endpoint_id,
                                 generation,
@@ -1387,26 +1421,16 @@ async fn run_client_loop(
                         let _ = (transfer_id, image_id);
                     }
                     ServerMessage::ServerShutdown { reason } => {
-                        if endpoint_id.is_local() {
+                        if !federated && endpoint_id.is_local() {
                             return Err(ClientError::ServerShutdown { reason });
                         }
-                        write_stream.disconnect(&endpoint_id);
-                        if handle_remote_endpoint_disconnect(
-                            &mut state,
-                            &mut write_stream,
-                            &mut endpoint_commands,
-                            &mut ssh_supervisors,
-                            &mut pending_activation,
+                        write_stream.fail(
                             &endpoint_id,
-                            now,
-                            "server stopped; reconnecting",
-                        ) {
-                            clear_endpoint_host_effects(
-                                &mut state,
-                                &host_mouse_capture_active,
-                                &host_sgr_pixels_active,
-                            );
-                        }
+                            io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                reason.unwrap_or_else(|| "server stopped".into()),
+                            ),
+                        );
                     }
                     ServerMessage::Notify {
                         kind,
@@ -1702,12 +1726,15 @@ async fn run_client_loop(
                                 continue;
                             }
                             Ok(endpoint::EndpointControlMessage::Snapshot(snapshot)) => snapshot,
-                            Err(message) if !endpoint::protocol_failure_is_fatal(&endpoint_id) => {
-                                if handle_remote_endpoint_attention(
+                            Err(message)
+                                if federated
+                                    || !endpoint::protocol_failure_is_fatal(&endpoint_id) =>
+                            {
+                                if handle_endpoint_attention(
                                     &mut state,
                                     &mut write_stream,
                                     &mut endpoint_commands,
-                                    &mut ssh_supervisors,
+                                    &mut supervisors,
                                     &mut pending_activation,
                                     &endpoint_id,
                                     generation,
@@ -1766,7 +1793,10 @@ async fn run_client_loop(
                             });
                         let activation_ready = state.shell.as_ref().is_some_and(|shell| {
                             shell.endpoint_has_snapshot(&selected_endpoint)
-                                && shell.endpoint_boot_id(write_stream.active_id()).is_some()
+                                && (!write_stream
+                                    .connection(write_stream.active_id())
+                                    .is_some_and(|connection| connection.surface_active)
+                                    || shell.endpoint_boot_id(write_stream.active_id()).is_some())
                         });
                         let needs_surface = write_stream
                             .connection(&selected_endpoint)
@@ -1791,34 +1821,58 @@ async fn run_client_loop(
                 if !write_stream.accepts(&endpoint_id, generation) {
                     continue;
                 }
-                write_stream.disconnect(&endpoint_id);
-                if endpoint_id.is_local() {
-                    #[cfg(unix)]
-                    state.retire_endpoint_graphics(&endpoint_id);
-                    return Err(ClientError::ConnectionLost(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "local server closed connection",
-                    )));
-                }
-                if handle_remote_endpoint_disconnect(
-                    &mut state,
-                    &mut write_stream,
-                    &mut endpoint_commands,
-                    &mut ssh_supervisors,
-                    &mut pending_activation,
+                write_stream.fail(
                     &endpoint_id,
-                    now,
-                    "connection was lost; reconnecting",
-                ) {
-                    clear_endpoint_host_effects(
-                        &mut state,
-                        &host_mouse_capture_active,
-                        &host_sgr_pixels_active,
-                    );
-                }
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "connection was lost"),
+                );
             }
             ClientLoopEvent::Timer => {
                 client_timer.fired();
+                #[cfg(unix)]
+                if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+                    matcher.expire();
+                }
+                state
+                    .detached_process_children
+                    .retain_mut(|child| child.try_wait().ok().flatten().is_none());
+                write_stream.tick_health(now);
+                for failure in write_stream.take_failures() {
+                    if write_stream.connection(&failure.endpoint_id).is_some()
+                        && !write_stream.accepts(&failure.endpoint_id, failure.generation)
+                    {
+                        continue;
+                    }
+                    warn!(
+                        endpoint = %failure.endpoint_id.storage_key(),
+                        error = %failure.message,
+                        "endpoint transport failed"
+                    );
+                    if !federated && failure.endpoint_id.is_local() {
+                        return Err(ClientError::ConnectionLost(io::Error::new(
+                            failure.kind,
+                            failure.message,
+                        )));
+                    }
+                    if handle_endpoint_disconnect(
+                        &mut state,
+                        &mut write_stream,
+                        &mut endpoint_commands,
+                        &mut supervisors,
+                        &mut pending_activation,
+                        &failure.endpoint_id,
+                        failure.generation,
+                        now,
+                        &format!("{}; reconnecting", failure.message),
+                    ) {
+                        clear_endpoint_host_effects(
+                            &mut state,
+                            &host_mouse_capture_active,
+                            &host_sgr_pixels_active,
+                        );
+                    }
+                }
+                // A revoked transport changes the safe rollback destination. Handle those
+                // failures before applying a timeout to the remaining activation phase.
                 if pending_activation
                     .as_ref()
                     .is_some_and(|activation| activation.expired(now))
@@ -1839,50 +1893,6 @@ async fn run_client_loop(
                         format!("{label} did not produce a coherent surface in time"),
                         false,
                     );
-                }
-                #[cfg(unix)]
-                if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                    matcher.expire();
-                }
-                state
-                    .detached_process_children
-                    .retain_mut(|child| child.try_wait().ok().flatten().is_none());
-                write_stream.tick_health(now);
-                for failure in write_stream.take_failures() {
-                    if write_stream.connection(&failure.endpoint_id).is_some()
-                        && !write_stream.accepts(&failure.endpoint_id, failure.generation)
-                    {
-                        continue;
-                    }
-                    warn!(
-                        endpoint = %failure.endpoint_id.storage_key(),
-                        error = %failure.message,
-                        "endpoint transport failed"
-                    );
-                    if failure.endpoint_id.is_local() {
-                        return Err(ClientError::ConnectionLost(io::Error::new(
-                            failure.kind,
-                            failure.message,
-                        )));
-                    }
-                    if failure.kind != io::ErrorKind::WouldBlock
-                        && handle_remote_endpoint_disconnect(
-                            &mut state,
-                            &mut write_stream,
-                            &mut endpoint_commands,
-                            &mut ssh_supervisors,
-                            &mut pending_activation,
-                            &failure.endpoint_id,
-                            now,
-                            "connection was lost; reconnecting",
-                        )
-                    {
-                        clear_endpoint_host_effects(
-                            &mut state,
-                            &host_mouse_capture_active,
-                            &host_sgr_pixels_active,
-                        );
-                    }
                 }
                 if state.shell.is_some() {
                     let expired_endpoints = endpoint_commands

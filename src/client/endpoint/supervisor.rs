@@ -1,18 +1,18 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::TryClone as _;
-
 use super::{ClientEndpointId, ClientEndpointStatus, EndpointNegotiation, NativeEndpointTransport};
 use crate::protocol::{ClientSurfaceSize, RenderEncoding};
+use interprocess::TryClone as _;
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
-pub(crate) struct SshConnectOptions {
+pub(crate) struct EndpointConnectOptions {
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) cell_width_px: u32,
@@ -23,7 +23,7 @@ pub(crate) struct SshConnectOptions {
     pub(crate) mouse_capture: bool,
 }
 
-pub(crate) enum SshSupervisorEvent {
+pub(crate) enum EndpointSupervisorEvent {
     Status {
         endpoint_id: ClientEndpointId,
         generation: u64,
@@ -39,52 +39,73 @@ pub(crate) enum SshSupervisorEvent {
     },
 }
 
-struct ProfileReconnectState {
-    profile: super::SavedSshEndpoint,
+#[derive(Clone)]
+enum ConnectTarget {
+    Local(PathBuf),
+    Ssh(super::SavedSshEndpoint),
+}
+
+struct ReconnectState {
+    target: ConnectTarget,
     attempts: u32,
     next_attempt: Option<Instant>,
     in_flight: bool,
     generation: Option<u64>,
 }
 
-pub(crate) struct SshSupervisors {
-    profiles: HashMap<ClientEndpointId, ProfileReconnectState>,
+impl ReconnectState {
+    fn new(target: ConnectTarget, now: Instant) -> Self {
+        Self {
+            target,
+            attempts: 0,
+            next_attempt: Some(now),
+            in_flight: false,
+            generation: None,
+        }
+    }
+}
+
+pub(crate) struct EndpointSupervisors {
+    endpoints: HashMap<ClientEndpointId, ReconnectState>,
     next_generation: u64,
     shutdown: Arc<AtomicBool>,
 }
 
-impl SshSupervisors {
+impl EndpointSupervisors {
     pub(crate) fn new(profiles: &[super::SavedSshEndpoint], now: Instant) -> Self {
-        let profiles = profiles
+        let endpoints = profiles
             .iter()
             .filter(|profile| profile.enabled)
             .map(|profile| {
                 (
                     ClientEndpointId::Ssh(profile.id.clone()),
-                    ProfileReconnectState {
-                        profile: profile.clone(),
-                        attempts: 0,
-                        next_attempt: Some(now),
-                        in_flight: false,
-                        generation: None,
-                    },
+                    ReconnectState::new(ConnectTarget::Ssh(profile.clone()), now),
                 )
             })
             .collect();
         Self {
-            profiles,
+            endpoints,
             next_generation: 2,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    pub(crate) fn add_local(&mut self, path: PathBuf, generation: Option<u64>, now: Instant) {
+        let mut state = ReconnectState::new(ConnectTarget::Local(path), now);
+        state.generation = generation;
+        if generation.is_some() {
+            state.next_attempt = None;
+        }
+        self.endpoints.insert(ClientEndpointId::Local, state);
+    }
+
     pub(crate) fn spawn_due(
         &mut self,
         now: Instant,
-        options: SshConnectOptions,
-        event_tx: &tokio::sync::mpsc::Sender<SshSupervisorEvent>,
+        options: EndpointConnectOptions,
+        event_tx: &tokio::sync::mpsc::Sender<EndpointSupervisorEvent>,
     ) {
-        for (endpoint_id, state) in &mut self.profiles {
+        for (endpoint_id, state) in &mut self.endpoints {
             if state.in_flight || state.next_attempt.is_none_or(|deadline| deadline > now) {
                 continue;
             }
@@ -94,7 +115,7 @@ impl SshSupervisors {
             state.generation = Some(generation);
             self.next_generation = self.next_generation.saturating_add(1);
             let endpoint_id = endpoint_id.clone();
-            let profile = state.profile.clone();
+            let target = state.target.clone();
             let event_tx = event_tx.clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
@@ -103,26 +124,26 @@ impl SshSupervisors {
                 }
                 let task_endpoint_id = endpoint_id.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    connect_once(&profile, options, endpoint_id, generation)
+                    connect_once(&target, options, endpoint_id, generation)
                 })
                 .await;
                 let event = match result {
                     Ok(Ok(event)) => event,
-                    Ok(Err((endpoint_id, error))) => SshSupervisorEvent::Status {
-                        endpoint_id,
+                    Ok(Err(error)) => EndpointSupervisorEvent::Status {
+                        endpoint_id: task_endpoint_id,
                         generation,
-                        status: if crate::remote::saved_ssh_failure_needs_attention(&error) {
+                        status: if failure_needs_attention(&error) {
                             ClientEndpointStatus::Attention
                         } else {
                             ClientEndpointStatus::Reconnecting
                         },
                         message: error.to_string(),
                     },
-                    Err(error) => SshSupervisorEvent::Status {
+                    Err(error) => EndpointSupervisorEvent::Status {
                         endpoint_id: task_endpoint_id,
                         generation,
                         status: ClientEndpointStatus::Reconnecting,
-                        message: format!("SSH connection task stopped unexpectedly: {error}"),
+                        message: format!("endpoint connection task stopped unexpectedly: {error}"),
                     },
                 };
                 if !shutdown.load(Ordering::Acquire) {
@@ -139,12 +160,12 @@ impl SshSupervisors {
         status: ClientEndpointStatus,
         now: Instant,
     ) -> bool {
-        let Some(state) = self.profiles.get_mut(endpoint_id) else {
+        let Some(state) = self.endpoints.get_mut(endpoint_id) else {
             return false;
         };
         if state.generation != Some(generation) {
             return false;
-        };
+        }
         state.in_flight = false;
         match status {
             ClientEndpointStatus::Online => {
@@ -152,7 +173,7 @@ impl SshSupervisors {
                 state.next_attempt = None;
             }
             ClientEndpointStatus::Attention | ClientEndpointStatus::Disabled => {
-                state.next_attempt = None;
+                state.next_attempt = None
             }
             ClientEndpointStatus::Connecting | ClientEndpointStatus::Reconnecting => {
                 state.attempts = state.attempts.saturating_add(1);
@@ -162,46 +183,59 @@ impl SshSupervisors {
         true
     }
 
-    pub(crate) fn disconnected(&mut self, endpoint_id: &ClientEndpointId, now: Instant) {
-        let Some(state) = self.profiles.get_mut(endpoint_id) else {
-            return;
-        };
-        state.in_flight = false;
-        state.attempts = state.attempts.saturating_add(1).max(1);
-        state.next_attempt = Some(now + retry_delay(state.attempts));
+    pub(crate) fn disconnected(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+        now: Instant,
+    ) -> bool {
+        self.record_status(
+            endpoint_id,
+            generation,
+            ClientEndpointStatus::Reconnecting,
+            now,
+        )
     }
 }
 
-impl Drop for SshSupervisors {
+impl Drop for EndpointSupervisors {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
     }
 }
 
 fn connect_once(
-    profile: &super::SavedSshEndpoint,
-    options: SshConnectOptions,
+    target: &ConnectTarget,
+    options: EndpointConnectOptions,
     endpoint_id: ClientEndpointId,
     generation: u64,
-) -> Result<SshSupervisorEvent, (ClientEndpointId, std::io::Error)> {
-    let mut connected =
-        crate::remote::connect_saved_ssh(profile.id.as_str(), &profile.target, &profile.session)
-            .map_err(|error| {
-                let error = if crate::remote::saved_ssh_failure_needs_attention(&error) {
+) -> Result<EndpointSupervisorEvent, std::io::Error> {
+    let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
+        ConnectTarget::Local(path) => {
+            let stream = crate::ipc::connect_local_stream(path).map_err(|error| {
+                // An absent Local socket is transient, unlike a missing SSH install.
+                if error.kind() == std::io::ErrorKind::NotFound {
                     std::io::Error::new(
-                        error.kind(),
-                        format!(
-                    "{error}. Run `{}` interactively to approve setup, then restart this client",
-                    crate::remote::saved_ssh_bootstrap_command(&profile.target, &profile.session)
-                ),
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Local is unavailable; start its server to reconnect",
                     )
                 } else {
                     error
-                };
-                (endpoint_id.clone(), error)
+                }
             })?;
+            (stream, Box::new(()))
+        }
+        ConnectTarget::Ssh(profile) => {
+            let connected = crate::remote::connect_saved_ssh(profile.id.as_str(), &profile.target, &profile.session).map_err(|error| {
+                if failure_needs_attention(&error) {
+                    std::io::Error::new(error.kind(), format!("{error}. Run `{}` interactively to approve setup, then restart this client", crate::remote::saved_ssh_bootstrap_command(&profile.target, &profile.session)))
+                } else { error }
+            })?;
+            (connected.stream, Box::new(connected.bridge))
+        }
+    };
     let handshake = super::super::do_handshake(
-        &mut connected.stream,
+        &mut stream,
         options.cols,
         options.rows,
         options.cell_width_px,
@@ -212,49 +246,43 @@ fn connect_once(
         options.mouse_capture,
         false,
     )
-    .map_err(|error| (endpoint_id.clone(), handshake_error(error)))?;
+    .map_err(handshake_error)?;
     if handshake.encoding != RenderEncoding::SemanticFrame {
-        return Err((
-            endpoint_id,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "SSH endpoint did not negotiate the semantic client shell",
-            ),
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "endpoint did not negotiate the semantic client shell",
         ));
     }
     let negotiation = EndpointNegotiation::new(
         handshake.endpoint_methods.unwrap_or_default(),
         handshake.endpoint_capabilities.unwrap_or_default(),
     );
-    if !negotiation.supports_surface_interest() || !negotiation.supports_health_check() {
-        return Err((
-            endpoint_id,
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!(
-                    "{} does not support safe multi-machine lifecycle; run `herdr --remote {}` interactively to update it",
-                    profile.label, profile.target
-                ),
-            ),
+    if !negotiation.supports_surface_interest()
+        || (!endpoint_id.is_local() && !negotiation.supports_health_check())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this machine needs a server update before it can participate in multi-machine viewing",
         ));
     }
-    let reader = connected
-        .stream
-        .try_clone()
-        .map_err(|error| (endpoint_id.clone(), error))?;
-    Ok(SshSupervisorEvent::Connected {
+    let reader = stream.try_clone()?;
+    let writer = NativeEndpointTransport::with_lifetime(stream, lifetime)?;
+    Ok(EndpointSupervisorEvent::Connected {
         endpoint_id,
         generation,
         reader,
-        writer: NativeEndpointTransport::with_lifetime(connected.stream, connected.bridge),
+        writer,
         negotiation,
     })
+}
+
+fn failure_needs_attention(error: &std::io::Error) -> bool {
+    crate::remote::saved_ssh_failure_needs_attention(error)
 }
 
 fn handshake_error(error: crate::client::ClientError) -> std::io::Error {
     use crate::client::ClientError;
     use crate::protocol::FramingError;
-
     match error {
         ClientError::ConnectionFailed(error) | ClientError::ConnectionLost(error) => error,
         ClientError::HandshakeRejected { error, .. } => {
@@ -266,7 +294,7 @@ fn handshake_error(error: crate::client::ClientError) -> std::io::Error {
         }
         ClientError::ServerShutdown { reason } => std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
-            reason.unwrap_or_else(|| "remote server shut down during handshake".into()),
+            reason.unwrap_or_else(|| "server shut down during handshake".into()),
         ),
     }
 }
@@ -307,61 +335,57 @@ mod tests {
         let timeout = handshake_error(crate::client::ClientError::ConnectionLost(
             std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
         ));
-        assert_eq!(timeout.kind(), std::io::ErrorKind::TimedOut);
-        assert!(!crate::remote::saved_ssh_failure_needs_attention(&timeout));
-
+        assert!(!failure_needs_attention(&timeout));
         let rejected = handshake_error(crate::client::ClientError::HandshakeRejected {
             version: 1,
             error: "surface capability missing".into(),
         });
         assert_eq!(rejected.kind(), std::io::ErrorKind::Unsupported);
-        assert!(crate::remote::saved_ssh_failure_needs_attention(&rejected));
+        assert!(failure_needs_attention(&rejected));
     }
 
     #[test]
-    fn attention_stops_background_retries() {
+    fn healthy_local_only_retries_after_its_connection_fails() {
         let now = Instant::now();
-        let mut supervisors = SshSupervisors::new(&[profile()], now);
+        let mut supervisors = EndpointSupervisors::new(&[profile()], now);
+        supervisors.add_local(PathBuf::from("local.sock"), Some(1), now);
+        assert!(supervisors.endpoints[&ClientEndpointId::Local]
+            .next_attempt
+            .is_none());
+        assert!(!supervisors.disconnected(&ClientEndpointId::Local, 0, now));
+        assert!(supervisors.endpoints[&ClientEndpointId::Local]
+            .next_attempt
+            .is_none());
+        assert!(supervisors.disconnected(&ClientEndpointId::Local, 1, now));
+        assert_eq!(
+            supervisors.endpoints[&ClientEndpointId::Local].next_attempt,
+            Some(now + INITIAL_RETRY_DELAY)
+        );
+        assert_eq!(
+            supervisors.endpoints[&ClientEndpointId::Ssh(profile().id)].next_attempt,
+            Some(now)
+        );
+    }
+
+    #[test]
+    fn ssh_recovery_rejects_stale_generations_and_stops_retries_for_attention() {
+        let now = Instant::now();
+        let mut supervisors = EndpointSupervisors::new(&[profile()], now);
         let endpoint_id = ClientEndpointId::Ssh(profile().id);
-        let generation = 2;
         supervisors
-            .profiles
+            .endpoints
             .get_mut(&endpoint_id)
             .unwrap()
-            .generation = Some(generation);
-        supervisors.record_status(
-            &endpoint_id,
-            generation,
-            ClientEndpointStatus::Attention,
-            now,
+            .generation = Some(4);
+        assert!(supervisors.record_status(&endpoint_id, 4, ClientEndpointStatus::Online, now));
+        assert!(!supervisors.disconnected(&endpoint_id, 3, now));
+        assert!(supervisors.endpoints[&endpoint_id].next_attempt.is_none());
+        assert!(supervisors.disconnected(&endpoint_id, 4, now));
+        assert_eq!(
+            supervisors.endpoints[&endpoint_id].next_attempt,
+            Some(now + INITIAL_RETRY_DELAY)
         );
-        let state = supervisors.profiles.get(&endpoint_id).unwrap();
-        assert!(state.next_attempt.is_none());
-        assert!(!state.in_flight);
-    }
-
-    #[test]
-    fn stale_generation_status_does_not_change_reconnect_state() {
-        let now = Instant::now();
-        let mut supervisors = SshSupervisors::new(&[profile()], now);
-        let endpoint_id = ClientEndpointId::Ssh(profile().id);
-        let state = supervisors.profiles.get_mut(&endpoint_id).unwrap();
-        state.generation = Some(4);
-        state.in_flight = true;
-
-        assert!(!supervisors.record_status(&endpoint_id, 3, ClientEndpointStatus::Attention, now));
-        let state = supervisors.profiles.get(&endpoint_id).unwrap();
-        assert!(state.in_flight);
-        assert_eq!(state.generation, Some(4));
-    }
-
-    #[test]
-    fn disconnect_schedules_a_bounded_noninteractive_retry() {
-        let now = Instant::now();
-        let mut supervisors = SshSupervisors::new(&[profile()], now);
-        let endpoint_id = ClientEndpointId::Ssh(profile().id);
-        supervisors.disconnected(&endpoint_id, now);
-        let state = supervisors.profiles.get(&endpoint_id).unwrap();
-        assert_eq!(state.next_attempt, Some(now + INITIAL_RETRY_DELAY));
+        assert!(supervisors.record_status(&endpoint_id, 4, ClientEndpointStatus::Attention, now));
+        assert!(supervisors.endpoints[&endpoint_id].next_attempt.is_none());
     }
 }

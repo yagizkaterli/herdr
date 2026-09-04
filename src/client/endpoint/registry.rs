@@ -4,41 +4,19 @@ use std::time::Instant;
 
 use super::health::{EndpointHealth, HealthAction};
 use super::ClientEndpointId;
-use crate::ipc::LocalStream;
 use crate::protocol::ClientMessage;
 
 pub(crate) trait EndpointTransport: Send {
     fn send(&mut self, message: &ClientMessage) -> io::Result<()>;
 
-    fn disconnect(&mut self) {
-        let _ = self.send(&ClientMessage::Detach);
-    }
-}
+    fn disconnect(&mut self) {}
 
-pub(crate) struct NativeEndpointTransport {
-    stream: LocalStream,
-    _lifetime: Option<Box<dyn Send>>,
-}
-
-impl NativeEndpointTransport {
-    pub(crate) fn new(stream: LocalStream) -> Self {
-        Self {
-            stream,
-            _lifetime: None,
-        }
+    fn flush(&mut self, _deadline: Instant) -> io::Result<()> {
+        Ok(())
     }
 
-    pub(crate) fn with_lifetime(stream: LocalStream, lifetime: impl Send + 'static) -> Self {
-        Self {
-            stream,
-            _lifetime: Some(Box::new(lifetime)),
-        }
-    }
-}
-
-impl EndpointTransport for NativeEndpointTransport {
-    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
-        super::super::write_to_local_server(&mut self.stream, message)
+    fn take_error(&mut self) -> Option<io::Error> {
+        None
     }
 }
 
@@ -111,26 +89,30 @@ pub(crate) struct EndpointRegistry {
 }
 
 impl EndpointRegistry {
+    pub(crate) fn empty() -> Self {
+        Self {
+            active: ClientEndpointId::Local,
+            input_enabled: false,
+            connections: HashMap::new(),
+            failures: Vec::new(),
+        }
+    }
+
     pub(crate) fn new(
         local: impl EndpointTransport + 'static,
         generation: u64,
         negotiation: EndpointNegotiation,
     ) -> Self {
-        Self {
-            active: ClientEndpointId::Local,
-            input_enabled: true,
-            connections: HashMap::from([(
-                ClientEndpointId::Local,
-                EndpointConnection {
-                    transport: Box::new(local),
-                    generation,
-                    surface_active: true,
-                    negotiation,
-                    health: None,
-                },
-            )]),
-            failures: Vec::new(),
-        }
+        let mut registry = Self::empty();
+        registry.input_enabled = true;
+        registry.insert(
+            ClientEndpointId::Local,
+            local,
+            generation,
+            negotiation,
+            true,
+        );
+        registry
     }
 
     pub(crate) fn active_id(&self) -> &ClientEndpointId {
@@ -165,8 +147,7 @@ impl EndpointRegistry {
         negotiation: EndpointNegotiation,
         surface_active: bool,
     ) {
-        let health = negotiation
-            .supports_health_check()
+        let health = (!endpoint_id.is_local() && negotiation.supports_health_check())
             .then(|| EndpointHealth::new(Instant::now()));
         if let Some(mut previous) = self.connections.insert(
             endpoint_id,
@@ -308,7 +289,24 @@ impl EndpointRegistry {
         }
     }
 
+    pub(crate) fn fail(&mut self, endpoint_id: &ClientEndpointId, error: io::Error) {
+        self.record_failure(endpoint_id.clone(), error);
+    }
+
     pub(crate) fn take_failures(&mut self) -> Vec<EndpointTransportFailure> {
+        let errors = self
+            .connections
+            .iter_mut()
+            .filter_map(|(id, connection)| {
+                connection
+                    .transport
+                    .take_error()
+                    .map(|error| (id.clone(), error))
+            })
+            .collect::<Vec<_>>();
+        for (endpoint_id, error) in errors {
+            self.record_failure(endpoint_id, error);
+        }
         std::mem::take(&mut self.failures)
     }
 
@@ -326,10 +324,8 @@ impl EndpointRegistry {
             kind: error.kind(),
             message: error.to_string(),
         };
-        if failure.kind != io::ErrorKind::WouldBlock {
-            if let Some(mut connection) = self.connections.remove(&endpoint_id) {
-                connection.transport.disconnect();
-            }
+        if let Some(mut connection) = self.connections.remove(&endpoint_id) {
+            connection.transport.disconnect();
         }
         if let Some(existing) = self
             .failures
@@ -345,7 +341,12 @@ impl EndpointRegistry {
 
 impl Drop for EndpointRegistry {
     fn drop(&mut self) {
-        for (_, mut connection) in self.connections.drain() {
+        let deadline = Instant::now() + std::time::Duration::from_millis(250);
+        for connection in self.connections.values_mut() {
+            let _ = connection.transport.send(&ClientMessage::Detach);
+        }
+        for connection in self.connections.values_mut() {
+            let _ = connection.transport.flush(deadline);
             connection.transport.disconnect();
         }
     }
@@ -462,6 +463,26 @@ mod tests {
             false,
         );
         assert!(!registry.active_surface_available());
+    }
+
+    #[test]
+    fn recovered_local_uses_transport_failure_not_remote_health_probes() {
+        let mut registry = EndpointRegistry::empty();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        registry.insert(
+            ClientEndpointId::Local,
+            FakeTransport {
+                sent: sent.clone(),
+                error: None,
+            },
+            2,
+            negotiation(),
+            false,
+        );
+        registry.tick_health(Instant::now() + std::time::Duration::from_secs(300));
+        assert!(registry.connection(&ClientEndpointId::Local).is_some());
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(registry.take_failures().is_empty());
     }
 
     #[test]

@@ -1,6 +1,35 @@
 use super::*;
 
-/// Blocking thread that reads server messages and tags them with their connection generation.
+pub(super) fn start_endpoint_transport(
+    stream: LocalStream,
+    lifetime: impl Send + 'static,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    endpoint_id: endpoint::ClientEndpointId,
+    generation: u64,
+    max_frame_size: usize,
+) -> Result<endpoint::NativeEndpointTransport, ClientError> {
+    let reader = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
+    let transport = endpoint::NativeEndpointTransport::with_lifetime(stream, lifetime)
+        .map_err(ClientError::ConnectionFailed)?;
+    let stopped = transport.stop_handle();
+    let event_tx = event_tx.clone();
+    std::thread::Builder::new()
+        .name("endpoint-reader".into())
+        .spawn(move || {
+            server_reader_thread(
+                reader,
+                event_tx,
+                &stopped,
+                max_frame_size,
+                endpoint_id,
+                generation,
+            );
+        })
+        .map_err(ClientError::ConnectionFailed)?;
+    Ok(transport)
+}
+
+/// Reads complete frames while retaining partial-read progress across nonblocking polls.
 pub(super) fn server_reader_thread(
     mut stream: LocalStream,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
@@ -9,7 +38,7 @@ pub(super) fn server_reader_thread(
     endpoint_id: endpoint::ClientEndpointId,
     generation: u64,
 ) {
-    if stream.set_nonblocking(false).is_err() {
+    if stream.set_nonblocking(true).is_err() {
         let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
             endpoint_id,
             generation,
@@ -17,6 +46,10 @@ pub(super) fn server_reader_thread(
         return;
     }
 
+    let mut stream = EndpointReader {
+        stream: &mut stream,
+        stopped: should_quit,
+    };
     loop {
         if should_quit.load(Ordering::Acquire) {
             break;
@@ -57,6 +90,28 @@ pub(super) fn server_reader_thread(
     }
 }
 
+struct EndpointReader<'a> {
+    stream: &'a mut LocalStream,
+    stopped: &'a AtomicBool,
+}
+
+impl io::Read for EndpointReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            match crate::ipc::poll_local_stream_read_count(self.stream, buffer)? {
+                crate::ipc::LocalStreamReadCount::Data(count) => return Ok(count),
+                crate::ipc::LocalStreamReadCount::Closed => return Ok(0),
+                crate::ipc::LocalStreamReadCount::Pending => {
+                    crate::platform::wait_client_stream_readable(self.stream)?;
+                }
+            }
+        }
+    }
+}
+
 pub(in crate::client) fn write_to_local_server(
     stream: &mut LocalStream,
     msg: &ClientMessage,
@@ -76,18 +131,10 @@ impl ClientMessageSink for LocalStream {
 
 impl ClientMessageSink for endpoint::EndpointRegistry {
     fn send_client_message(&mut self, message: &ClientMessage) -> io::Result<()> {
-        let active = self.active_id().clone();
-        if self.send(message) == endpoint::EndpointSendOutcome::Sent || !active.is_local() {
-            return Ok(());
-        }
-        let failure = self
-            .take_failures()
-            .into_iter()
-            .find(|failure| failure.endpoint_id == active);
-        Err(failure.map_or_else(
-            || io::Error::new(io::ErrorKind::BrokenPipe, "local endpoint is unavailable"),
-            |failure| io::Error::new(failure.kind, failure.message),
-        ))
+        // The lifecycle loop consumes failures for every endpoint, including Local. A send
+        // failure must not bypass that transition or tear down unrelated connections.
+        self.send(message);
+        Ok(())
     }
 }
 

@@ -15,6 +15,15 @@ use std::{
 
 mod clipboard_image;
 
+pub(crate) fn wait_client_stream_readable(
+    _stream: &crate::ipc::LocalStream,
+) -> std::io::Result<()> {
+    // Sync named pipes have no read timeout. The caller peeks before each read and checks its
+    // cancellation flag between polls, including when a frame arrives in several fragments.
+    std::thread::sleep(Duration::from_millis(2));
+    Ok(())
+}
+
 pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::size()
 }

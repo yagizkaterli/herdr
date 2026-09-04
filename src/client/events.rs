@@ -21,7 +21,7 @@ pub(super) enum ClientLoopEvent {
         endpoint_id: endpoint::ClientEndpointId,
         generation: u64,
     },
-    SshSupervisor(endpoint::SshSupervisorEvent),
+    EndpointSupervisor(endpoint::EndpointSupervisorEvent),
     ActivateEndpoint {
         endpoint_id: endpoint::ClientEndpointId,
         target: Option<shell::ClientEndpointFocusTarget>,

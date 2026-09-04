@@ -259,7 +259,7 @@ pub(super) fn render_shell(
                 super::endpoint_sidebar::render_expanded(
                     buffer,
                     layout.sidebar,
-                    snapshot,
+                    Some(snapshot),
                     config,
                     &mut state,
                     &mut hits,

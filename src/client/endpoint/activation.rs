@@ -316,8 +316,6 @@ impl PendingEndpointActivation {
                 };
             }
         };
-        let host_focused = self.host_focused;
-
         match &mut self.phase {
             ActivationPhase::ReleasingSource { .. } => {
                 if let Err(message) = surface_set_revision(&result, false) {
@@ -349,21 +347,6 @@ impl PendingEndpointActivation {
                     }
                 };
                 *acknowledged_revision = Some(revision);
-                // Older endpoint servers only apply ClientShellFocus to an active viewer. The
-                // baseline was already ordered before surface.set(true); replay it after the
-                // acknowledgement so those servers observe the same current host state.
-                if endpoints.send_to(
-                    &self.target.endpoint_id,
-                    &crate::protocol::ClientMessage::ClientShellFocus {
-                        focused: host_focused,
-                    },
-                ) != EndpointSendOutcome::Sent
-                {
-                    return SurfaceActivationProgress::Rejected {
-                        message: "endpoint focus baseline could not be replayed".into(),
-                        source_release_rejected: false,
-                    };
-                }
                 self.progress()
             }
             ActivationPhase::ActivatingTarget {
@@ -435,18 +418,6 @@ impl PendingEndpointActivation {
                     }
                 };
                 *acknowledged_revision = Some(revision);
-                if endpoints.send_to(
-                    &self.source.endpoint_id,
-                    &crate::protocol::ClientMessage::ClientShellFocus {
-                        focused: host_focused,
-                    },
-                ) != EndpointSendOutcome::Sent
-                {
-                    return SurfaceActivationProgress::Rejected {
-                        message: "source endpoint focus baseline could not be replayed".into(),
-                        source_release_rejected: false,
-                    };
-                }
                 self.progress()
             }
             ActivationPhase::SynchronizingPresentation {
@@ -705,10 +676,8 @@ impl PendingEndpointActivation {
         }
     }
 
-    /// Recover a pending handoff when either endpoint disappears. A disconnected target cannot
-    /// retain this connection's surface, so the source can be restored. A disconnected source
-    /// can never be restored; if target-on was possible, first release it and then remain in a
-    /// clear unavailable state.
+    /// Losing the source revokes its surface and removes the rollback destination; it must not
+    /// cancel a healthy target. Losing the target restores the source when it is still available.
     pub(crate) fn endpoint_disconnected(
         &mut self,
         endpoints: &mut EndpointRegistry,
@@ -729,6 +698,25 @@ impl PendingEndpointActivation {
         }
         if self.source.endpoint_id != *endpoint_id {
             return ActivationRollback::Unavailable(error);
+        }
+        self.source_available = false;
+        if self.source.endpoint_id != self.target.endpoint_id {
+            match &self.phase {
+                ActivationPhase::ReleasingSource { .. } => {
+                    return match self.start_target(endpoints, self.resize.clone()) {
+                        Ok(()) => ActivationRollback::Pending,
+                        Err(message) => ActivationRollback::Unavailable(message),
+                    };
+                }
+                ActivationPhase::ActivatingTarget { .. } => return ActivationRollback::Pending,
+                ActivationPhase::SynchronizingPresentation { lease, .. }
+                | ActivationPhase::AwaitingPresentationEffects { lease, .. }
+                    if lease.endpoint_id == self.target.endpoint_id =>
+                {
+                    return ActivationRollback::Pending
+                }
+                _ => {}
+            }
         }
         match self.phase {
             ActivationPhase::ReleasingSource { .. } => ActivationRollback::Unavailable(error),
@@ -789,8 +777,13 @@ impl PendingEndpointActivation {
             ActivationPhase::ReleasingTargetForRollback { .. } => {
                 // The target may have observed target-on or target-off. Closing this transport
                 // is the only safe local revocation when target-off is not acknowledged.
-                endpoints.disconnect(&self.target.endpoint_id);
-                endpoints.set_surface_active(&self.target.endpoint_id, false);
+                endpoints.fail(
+                    &self.target.endpoint_id,
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "endpoint did not acknowledge surface revocation",
+                    ),
+                );
                 if !self.source_available {
                     return ActivationRollback::Unavailable(format!(
                         "{error}; the target connection was closed because no presentation owner could be proven"
@@ -931,6 +924,7 @@ impl PendingEndpointActivation {
         resize: crate::protocol::ClientMessage,
     ) -> Result<(), String> {
         let request_id = format!("client-shell-surface:{}:on", self.epoch);
+        self.deadline = Instant::now() + ACTIVATION_TIMEOUT;
         // A transport may fail after writing any baseline or surface message. Enter the target
         // phase first so every uncertain target write is reversed through target-off before
         // source restoration is considered.
@@ -942,14 +936,13 @@ impl PendingEndpointActivation {
             focus_acknowledged: self.focus.is_none(),
             evidence: ActivationEvidence::default(),
         };
-        // The target sees its current geometry and physical focus baseline before it becomes
-        // surface-active; navigation follows activation on the same lane.
-        send_target_baseline(endpoints, &self.target, &resize, self.host_focused)?;
-        let request = surface_interest_request(&self.target.boot_id, request_id, true)
-            .map_err(|error| error.to_string())?;
-        if endpoints.send_to(&self.target.endpoint_id, &request) != EndpointSendOutcome::Sent {
-            return Err("endpoint activation could not be sent".into());
-        }
+        send_surface_activation(
+            endpoints,
+            &self.target,
+            request_id,
+            &resize,
+            self.host_focused,
+        )?;
 
         // From this point the target may have processed surface.set(true). Optional navigation
         // is serialized through one coalescing focus lane.
@@ -1029,13 +1022,13 @@ impl PendingEndpointActivation {
             evidence: ActivationEvidence::default(),
         };
         self.deadline = Instant::now() + ACTIVATION_TIMEOUT;
-        send_target_baseline(endpoints, &self.source, &resize, self.host_focused)?;
-        let request = surface_interest_request(&self.source.boot_id, request_id, true)
-            .map_err(|error| error.to_string())?;
-        if endpoints.send_to(&self.source.endpoint_id, &request) != EndpointSendOutcome::Sent {
-            return Err("source endpoint restoration could not be sent".into());
-        }
-        Ok(())
+        send_surface_activation(
+            endpoints,
+            &self.source,
+            request_id,
+            &resize,
+            self.host_focused,
+        )
     }
 
     fn send_latest_focus(&mut self, endpoints: &mut EndpointRegistry) -> Result<(), String> {

@@ -113,15 +113,23 @@ pub(super) fn surface_matches_geometry(
     surface.frame.width == geometry.cols && surface.frame.height == geometry.rows
 }
 
-pub(super) fn send_target_baseline(
+pub(super) fn send_surface_activation(
     endpoints: &mut EndpointRegistry,
     target: &EndpointLease,
+    request_id: String,
     resize: &crate::protocol::ClientMessage,
     focused: bool,
 ) -> Result<(), String> {
     if endpoints.send_to(&target.endpoint_id, resize) != EndpointSendOutcome::Sent {
         return Err("endpoint resize could not be sent".into());
     }
+    let request = surface_interest_request(&target.boot_id, request_id, true)
+        .map_err(|error| error.to_string())?;
+    if endpoints.send_to(&target.endpoint_id, &request) != EndpointSendOutcome::Sent {
+        return Err("endpoint activation could not be sent".into());
+    }
+    // Inactive endpoints reject focus events. Activate first, then establish the host baseline
+    // on the same ordered transport before navigation or presentation can commit.
     if endpoints.send_to(
         &target.endpoint_id,
         &crate::protocol::ClientMessage::ClientShellFocus { focused },

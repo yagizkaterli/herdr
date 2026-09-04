@@ -399,10 +399,10 @@ fn source_release_is_sent_and_acknowledged_before_target_activation() {
         crate::protocol::ClientMessage::ClientShellResize { .. }
     ));
     assert_eq!(
-        remote.get(1),
+        remote.get(2),
         Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: true })
     );
-    assert_eq!(remote.get(2).and_then(surface_set_active), Some(true));
+    assert_eq!(remote.get(1).and_then(surface_set_active), Some(true));
 }
 
 #[test]
@@ -630,7 +630,7 @@ fn latest_host_focus_is_replayed_to_the_eventual_target() {
         &mut endpoints,
     );
     assert_eq!(
-        remote_sent.lock().unwrap().get(1),
+        remote_sent.lock().unwrap().get(2),
         Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: false })
     );
 
@@ -1167,6 +1167,15 @@ fn unacknowledged_target_release_closes_target_before_restoring_source() {
         ActivationRollback::Pending
     );
     assert!(endpoints.connection(&target).is_none());
+    let failures = endpoints.take_failures();
+    assert_eq!(
+        failures.len(),
+        1,
+        "rollback revocation must reach the reconnect owner"
+    );
+    assert_eq!(failures[0].endpoint_id, target);
+    assert_eq!(failures[0].generation, 7);
+    assert_eq!(failures[0].kind, std::io::ErrorKind::TimedOut);
     assert_eq!(
         local_sent
             .lock()
@@ -1176,6 +1185,115 @@ fn unacknowledged_target_release_closes_target_before_restoring_source() {
             .collect::<Vec<_>>(),
         vec![false, true]
     );
+}
+
+#[test]
+fn target_loss_at_activation_deadline_restores_source_before_timeout() {
+    let (shell, mut endpoints, local_sent, _) = shell_and_registry();
+    let target = endpoint();
+    let mut activation = PendingEndpointActivation::begin(
+        &shell,
+        &mut endpoints,
+        target.clone(),
+        None,
+        resize(),
+        30,
+        Instant::now(),
+    )
+    .unwrap();
+    activation.receive_response(
+        &ClientEndpointId::Local,
+        1,
+        "client-shell-surface:30:off",
+        &surface_success("client-shell-surface:30:off", false, 1),
+        &mut endpoints,
+    );
+    let now = Instant::now();
+    activation.deadline = now;
+    assert!(activation.expired(now));
+    endpoints.fail(&target, std::io::ErrorKind::UnexpectedEof.into());
+    // Match the client timer: apply transport failures before checking phase expiry.
+    for failure in endpoints.take_failures() {
+        assert_eq!(
+            activation.endpoint_disconnected(&mut endpoints, &failure.endpoint_id, failure.message),
+            ActivationRollback::Pending
+        );
+    }
+    assert!(matches!(
+        activation.phase,
+        ActivationPhase::RestoringSource { .. }
+    ));
+    assert!(!activation.expired(now));
+    assert_eq!(
+        local_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(surface_set_active)
+            .collect::<Vec<_>>(),
+        vec![false, true]
+    );
+}
+
+#[test]
+fn losing_local_during_handoff_does_not_revoke_the_healthy_target() {
+    for source_released in [false, true] {
+        let (shell, mut endpoints, _local_sent, remote_sent) = shell_and_registry();
+        let target = endpoint();
+        let mut activation = PendingEndpointActivation::begin(
+            &shell,
+            &mut endpoints,
+            target.clone(),
+            None,
+            resize(),
+            29,
+            Instant::now(),
+        )
+        .unwrap();
+        if source_released {
+            activation.receive_response(
+                &ClientEndpointId::Local,
+                1,
+                "client-shell-surface:29:off",
+                &surface_success("client-shell-surface:29:off", false, 1),
+                &mut endpoints,
+            );
+        }
+        if !source_released {
+            activation.deadline = Instant::now() - Duration::from_millis(1);
+        }
+        endpoints.fail(
+            &ClientEndpointId::Local,
+            std::io::ErrorKind::BrokenPipe.into(),
+        );
+        assert_eq!(
+            activation.endpoint_disconnected(
+                &mut endpoints,
+                &ClientEndpointId::Local,
+                "Local stopped".into()
+            ),
+            ActivationRollback::Pending
+        );
+        assert!(!activation.source_available);
+        assert!(
+            !activation.expired(Instant::now()),
+            "starting the healthy target must get a fresh deadline"
+        );
+        assert!(matches!(
+            activation.phase,
+            ActivationPhase::ActivatingTarget { .. }
+        ));
+        assert!(endpoints.connection(&target).is_some());
+        assert_eq!(
+            remote_sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(surface_set_active)
+                .collect::<Vec<_>>(),
+            vec![true]
+        );
+    }
 }
 
 #[test]
