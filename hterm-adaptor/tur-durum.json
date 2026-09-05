@@ -1,0 +1,8 @@
+{
+  "states": {
+    "nobet-notu": "blocked",
+    "olcum": "working",
+    "kapanis": "idle"
+  },
+  "default_state": "unknown"
+}
