@@ -242,7 +242,6 @@ mod tests {
         let transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
         let (done, received) = mpsc::channel();
         let reader = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
             let result = (|| {
                 let first: ClientMessage =
                     crate::protocol::read_message(&mut peer, crate::protocol::MAX_FRAME_SIZE)?;
@@ -258,7 +257,7 @@ mod tests {
             super::super::EndpointNegotiation::default(),
         );
         let input = ClientMessage::Input {
-            data: vec![b'x'; 1024 * 1024],
+            data: b"queued input".to_vec(),
         };
         assert_eq!(
             registry.send(&input),
@@ -269,6 +268,35 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .expect("clean exit must flush complete frames before closing");
+        assert_eq!(first, input);
+        assert_eq!(second, ClientMessage::Detach);
+        reader.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_endpoint_flush_drains_large_frames_before_detach() {
+        let (stream, mut peer, path) = streams();
+        let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
+        let (done, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let first: ClientMessage =
+                crate::protocol::read_message(&mut peer, crate::protocol::MAX_FRAME_SIZE).unwrap();
+            let second: ClientMessage =
+                crate::protocol::read_message(&mut peer, crate::protocol::MAX_FRAME_SIZE).unwrap();
+            done.send((first, second)).unwrap();
+        });
+        let input = ClientMessage::Input {
+            data: vec![b'x'; 1024 * 1024],
+        };
+        transport.send(&input).unwrap();
+        transport.send(&ClientMessage::Detach).unwrap();
+        // Large-frame correctness must not depend on the registry's short exit grace period.
+        transport
+            .flush(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        drop(transport);
+        let (first, second) = received.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(first, input);
         assert_eq!(second, ClientMessage::Detach);
         reader.join().unwrap();

@@ -966,9 +966,7 @@ fn worktree_create_previews_the_endpoint_owned_checkout_path() {
         &state.overlay,
         Some(ClientShellOverlay::WorktreeCreate(create))
             if create.checkout_path
-                == std::path::Path::new("/tmp/herdr-worktrees")
-                    .join("repo")
-                    .join("feature-client-shell").to_string_lossy()
+                == "/tmp/herdr-worktrees/repo/feature-client-shell"
     ));
     let submit = state.handle_input_bytes(b"\r");
     let [ClientShellAction::Endpoint { request, .. }] = &submit.actions[..] else {
