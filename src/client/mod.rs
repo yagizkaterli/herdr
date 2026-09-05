@@ -13,6 +13,7 @@
 //! - Displays sound/toast notifications forwarded from server
 
 mod attach;
+mod catalog_reload;
 mod clipboard_forwarding;
 mod clipboard_images;
 mod config_reload;
@@ -101,6 +102,7 @@ use frame_output::{
     contains_kitty_graphics_bytes, record_received_kitty_graphics,
     write_encoded_frame_with_graphics,
 };
+pub(crate) use handshake::probe_endpoint_negotiation;
 use handshake::{client_shell_keybinding_source, do_handshake, is_remote_client_process};
 #[cfg(test)]
 use handshake::{
@@ -405,7 +407,7 @@ async fn run_client_loop(
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
-    let federated = endpoint_catalog.has_enabled_ssh();
+    let mut federated = endpoint_catalog.has_enabled_ssh();
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
         shell.set_endpoint_catalog(&endpoint_catalog.ssh);
@@ -554,6 +556,10 @@ async fn run_client_loop(
     let mut next_surface_serial = 1_u64;
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
+    let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
+    if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
+        catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
+    }
 
     // This (foreground) client owns the prefix ASCII input-source switch
     // (implemented on macOS and Windows; a no-op on other platforms).
@@ -564,6 +570,95 @@ async fn run_client_loop(
     #[cfg(windows)]
     let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
+        if pending_activation.is_none() {
+            if let Some(reload) = pending_catalog.take() {
+                match reload {
+                    Ok(profiles) => {
+                        let now = std::time::Instant::now();
+                        if !federated && profiles.iter().any(|profile| profile.enabled) {
+                            // Keep Local recovery once enabled, even after removing the last SSH profile.
+                            federated = true;
+                            supervisors.add_local(
+                                client_socket_path(),
+                                write_stream
+                                    .connection(&endpoint::ClientEndpointId::Local)
+                                    .map(|connection| connection.generation),
+                                now,
+                            );
+                            if write_stream
+                                .connection(&endpoint::ClientEndpointId::Local)
+                                .is_some_and(|connection| {
+                                    !connection.negotiation.supports_surface_interest()
+                                })
+                            {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.receive_endpoint_unavailable(
+                                        "Update the Local server before switching between machines"
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
+                        let active_removed = catalog_reload::apply_profiles(
+                            &mut state,
+                            &mut write_stream,
+                            &mut endpoint_commands,
+                            &mut supervisors,
+                            &mut endpoint_catalog,
+                            profiles,
+                            now,
+                        );
+                        if active_removed {
+                            clear_endpoint_host_effects(
+                                &mut state,
+                                &host_mouse_capture_active,
+                                &host_sgr_pixels_active,
+                            );
+                            scheduled_activation = None;
+                            if state.shell.as_ref().is_some_and(|shell| {
+                                shell.endpoint_projection_available(
+                                    &endpoint::ClientEndpointId::Local,
+                                )
+                            }) && write_stream
+                                .connection(&endpoint::ClientEndpointId::Local)
+                                .is_some()
+                            {
+                                scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
+                                    endpoint_id: endpoint::ClientEndpointId::Local,
+                                    target: None,
+                                    force: true,
+                                });
+                            } else {
+                                present_handoff_unavailable(
+                                    &mut state,
+                                    "Local is unavailable; reconnecting".into(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "saved machines could not be reloaded; keeping current connections");
+                        if let Some(shell) = state.shell.as_mut() {
+                            shell.receive_endpoint_unavailable(format!(
+                                "Saved machines could not be reloaded; keeping current connections: {error}"
+                            ));
+                        }
+                    }
+                }
+                apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
+                if let Some(shell) = state.shell.as_mut() {
+                    let cleanup = shell.take_pending_graphics_cleanup();
+                    let frame = shell.compose(state.reported_size.0, state.reported_size.1);
+                    let frozen = state.presentation_frozen;
+                    state.presentation_frozen = false;
+                    state.present_graphics(&cleanup);
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
+                    state.presentation_frozen = frozen;
+                }
+            }
+        }
         if let Some(shell) = state.shell.as_ref() {
             supervisors.spawn_due(
                 std::time::Instant::now(),
@@ -622,6 +717,7 @@ async fn run_client_loop(
         }
 
         match event {
+            ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
                 let image_bridge_active = endpoint_accepts_local_images(
@@ -1025,6 +1121,9 @@ async fn run_client_loop(
                     if !supervisors.record_status(&endpoint_id, generation, status, now) {
                         continue;
                     }
+                    if status == endpoint::ClientEndpointStatus::Attention {
+                        warn!(endpoint = %endpoint_id.storage_key(), generation, error = %message, "endpoint needs attention");
+                    }
                     let unavailable = state.shell.as_mut().and_then(|shell| {
                         shell.set_endpoint_status(&endpoint_id, status);
                         (status == endpoint::ClientEndpointStatus::Attention
@@ -1087,10 +1186,11 @@ async fn run_client_loop(
                 target,
                 force,
             } => {
-                if endpoint_catalog.select_endpoint(&endpoint_id) {
-                    if let Err(error) = endpoint_catalog.store_selection() {
-                        warn!(%error, "failed to persist desired endpoint selection");
-                    }
+                if !endpoint_catalog.select_endpoint(&endpoint_id) {
+                    continue;
+                }
+                if let Err(error) = endpoint_catalog.store_selection() {
+                    warn!(%error, "failed to persist desired endpoint selection");
                 }
                 begin_endpoint_activation(
                     &mut state,

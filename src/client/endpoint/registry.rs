@@ -127,6 +127,11 @@ impl EndpointRegistry {
                 .is_some_and(|connection| connection.surface_active)
     }
 
+    pub(crate) fn select_unavailable_local(&mut self) {
+        self.active = ClientEndpointId::Local;
+        self.freeze_input();
+    }
+
     pub(crate) fn freeze_input(&mut self) {
         self.input_enabled = false;
     }
@@ -284,6 +289,8 @@ impl EndpointRegistry {
     }
 
     pub(crate) fn disconnect(&mut self, endpoint_id: &ClientEndpointId) {
+        self.failures
+            .retain(|failure| &failure.endpoint_id != endpoint_id);
         if let Some(mut connection) = self.connections.remove(endpoint_id) {
             connection.transport.disconnect();
         }

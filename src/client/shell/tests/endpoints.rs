@@ -53,6 +53,91 @@ fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
 }
 
 #[test]
+fn switching_machines_from_copy_mode_restores_terminal_input() {
+    let (mut state, remote) = state_with_remote();
+    let mut local_surface = surface();
+    local_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 20,
+        viewport_rows: 2,
+    });
+    state.set_pane_surface(local_surface);
+    state.compose(100, 28).unwrap();
+    assert!(state.enter_copy_mode(&mut ClientShellInput::default()));
+    assert_eq!(state.mode, ClientShellMode::Copy);
+
+    assert!(state.activate_endpoint_projection(&remote));
+    let mut remote_surface = surface();
+    remote_surface.boot_id = "remote-boot".into();
+    state.set_pane_surface(remote_surface);
+    state.compose(100, 28).unwrap();
+
+    assert!(state.copy_mode.is_none());
+    assert_eq!(state.mode, ClientShellMode::Terminal);
+    let input = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    ))]);
+    assert!(matches!(
+        input.requests.as_slice(),
+        [ClientMessage::ClientShellPaneInput { pane_id, events }]
+            if pane_id == "pane_1" && events.len() == 1
+    ));
+}
+
+#[test]
+fn live_catalog_rename_preserves_snapshot_and_disable_reenable_clears_it() {
+    let (mut state, remote) = state_with_remote();
+    let mut profile = remote_profile();
+    profile.label = "Renamed".into();
+    state.set_endpoint_catalog(&[profile.clone()]);
+    assert_eq!(state.endpoint_label(&remote), "Renamed");
+    assert!(state.endpoint_is_online(&remote));
+    assert_eq!(state.endpoint_boot_id(&remote), Some("remote-boot"));
+    profile.enabled = false;
+    state.set_endpoint_catalog(&[profile.clone()]);
+    assert_eq!(
+        state.endpoint_status(&remote),
+        Some(ClientEndpointStatus::Disabled)
+    );
+    assert!(!state.endpoint_has_snapshot(&remote));
+    profile.enabled = true;
+    state.set_endpoint_catalog(&[profile]);
+    assert_eq!(
+        state.endpoint_status(&remote),
+        Some(ClientEndpointStatus::Connecting)
+    );
+    assert!(!state.endpoint_has_snapshot(&remote));
+}
+
+#[test]
+fn live_catalog_active_removal_does_not_retain_remote_projection_or_input() {
+    let (mut state, remote) = state_with_remote();
+    assert!(state.activate_endpoint_projection(&remote));
+    state.set_pane_surface(surface());
+    state.mode = ClientShellMode::Prefix;
+    state.overlay = Some(ClientShellOverlay::Onboarding);
+    state.select_unavailable_local();
+    state.retire_endpoint(&remote);
+    state.set_endpoint_catalog(&[]);
+    assert!(state.endpoint_is_active(&ClientEndpointId::Local));
+    assert!(state.snapshot.is_none());
+    assert!(state.pane_surface.is_none());
+    assert!(state.pending_pane_surface.is_none());
+    assert!(state.overlay.is_none());
+    assert_eq!(state.mode, ClientShellMode::Terminal);
+    assert!(state.endpoint_has_snapshot(&ClientEndpointId::Local));
+    let frame = state.compose(100, 30).unwrap();
+    let buffer = frame.to_ratatui_buffer().unwrap();
+    let text = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!text.contains("remote-workspace"));
+}
+
+#[test]
 fn machine_navigation_does_not_require_a_local_snapshot_or_surface() {
     for (cols, rows) in [(100, 28), (36, 18)] {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));

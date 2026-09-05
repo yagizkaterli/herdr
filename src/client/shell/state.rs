@@ -1192,6 +1192,61 @@ impl ClientShellState {
         }
     }
 
+    pub(super) fn reset_endpoint_projection(&mut self) {
+        self.hits = ShellHitMap::default();
+        self.pane_surface = None;
+        self.pending_pane_surface = None;
+        self.input_leases = ClientInputLeases::default();
+        self.popup_terminal_id = None;
+        self.chrome_drag = None;
+        self.workspace_press = None;
+        self.tab_press = None;
+        self.workspace_scroll = 0;
+        self.agent_scroll = 0;
+        self.tab_scroll = 0;
+        self.mobile_switcher_scroll = 0;
+        self.reveal_focused_workspace = true;
+        self.reveal_mobile_workspace = false;
+        self.mobile_switcher_suspended = false;
+        self.reveal_focused_tab = true;
+        self.last_tab_bar_width = None;
+        self.last_composed_size = None;
+        self.pending_requests.clear();
+        self.pane_scroll_in_flight.clear();
+        self.pane_scroll_queued.clear();
+        self.pane_scroll_targets.clear();
+        self.popup_pending = false;
+        self.popup_pending_deadline = None;
+        self.pending_integration_installs = 0;
+        self.endpoint_notice_seen.clear();
+        self.visible_endpoint_notice = None;
+        self.endpoint_error = None;
+        self.navigate_workspace_id = None;
+        self.overlay = self
+            .config
+            .startup_onboarding
+            .then_some(ClientShellOverlay::Onboarding);
+        self.previous_pane_id = None;
+        self.pane_mouse_gesture = None;
+        self.url_click_consumes_until_up = false;
+        self.replaying_url_click = false;
+        self.selection = None;
+        self.last_pane_click = None;
+        self.selection_autoscroll = None;
+        self.selection_autoscroll_deadline = None;
+        self.selection_highlight_clear_deadline = None;
+        self.pending_word_selection = None;
+        self.copy_mode = None;
+        if self.mode == ClientShellMode::Copy {
+            self.mode = ClientShellMode::Terminal;
+        }
+        self.reset_copy_pipeline();
+        self.copy_feedback = None;
+        self.copy_feedback_deadline = None;
+        self.host_mouse_pixels = None;
+        self.dismissed_product_announcement = None;
+    }
+
     pub(super) fn apply_active_snapshot(&mut self, mut snapshot: Box<ClientShellSnapshot>) {
         snapshot
             .commands
@@ -1263,54 +1318,7 @@ impl ClientShellState {
             self.hits = ShellHitMap::default();
         }
         if boot_changed {
-            self.pane_surface = None;
-            self.pending_pane_surface = None;
-            self.input_leases = ClientInputLeases::default();
-            self.popup_terminal_id = None;
-            self.chrome_drag = None;
-            self.workspace_press = None;
-            self.tab_press = None;
-            self.workspace_scroll = 0;
-            self.agent_scroll = 0;
-            self.tab_scroll = 0;
-            self.mobile_switcher_scroll = 0;
-            self.reveal_focused_workspace = true;
-            self.reveal_mobile_workspace = false;
-            self.mobile_switcher_suspended = false;
-            self.reveal_focused_tab = true;
-            self.last_tab_bar_width = None;
-            self.last_composed_size = None;
-            self.pending_requests.clear();
-            self.pane_scroll_in_flight.clear();
-            self.pane_scroll_queued.clear();
-            self.pane_scroll_targets.clear();
-            self.popup_pending = false;
-            self.popup_pending_deadline = None;
-            self.pending_integration_installs = 0;
-            self.endpoint_notice_seen.clear();
-            self.visible_endpoint_notice = None;
-            self.endpoint_error = None;
-            self.navigate_workspace_id = None;
-            self.overlay = self
-                .config
-                .startup_onboarding
-                .then_some(ClientShellOverlay::Onboarding);
-            self.previous_pane_id = None;
-            self.pane_mouse_gesture = None;
-            self.url_click_consumes_until_up = false;
-            self.replaying_url_click = false;
-            self.selection = None;
-            self.last_pane_click = None;
-            self.selection_autoscroll = None;
-            self.selection_autoscroll_deadline = None;
-            self.selection_highlight_clear_deadline = None;
-            self.pending_word_selection = None;
-            self.copy_mode = None;
-            self.reset_copy_pipeline();
-            self.copy_feedback = None;
-            self.copy_feedback_deadline = None;
-            self.host_mouse_pixels = None;
-            self.dismissed_product_announcement = None;
+            self.reset_endpoint_projection();
         } else if let Some(previous) = self
             .snapshot
             .as_deref()

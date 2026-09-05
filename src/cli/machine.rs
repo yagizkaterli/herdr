@@ -10,6 +10,10 @@ const HELP: &str = "Usage:
   herdr machine enable <profile-id>
   herdr machine disable <profile-id>
 
+Add prepares the remote Herdr installation and starts its server before saving.
+Missing or incompatible installations require approval in an interactive terminal.
+Changes apply automatically to open local Herdr clients.
+Removing or disabling a machine leaves its remote sessions running.
 Saved machines contain only a label, SSH target, explicit Herdr session, and enabled state.
 SSH credentials and key material remain owned by OpenSSH.";
 
@@ -130,8 +134,25 @@ fn add(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
     let session = session.unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
-    let bootstrap = crate::remote::saved_ssh_bootstrap_command(target, &session);
     let mut catalog = load_catalog()?;
+    match catalog.add_ssh(label.clone(), target, session.clone()) {
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(2);
+        }
+    }
+    if let Err(error) = crate::remote::prepare_saved_ssh(target, &session) {
+        eprintln!("error: {error}; machine was not saved");
+        crate::remote::print_remote_error_hint(&error, target);
+        return Ok(1);
+    }
+    // Setup can wait for human approval. Do not overwrite catalog edits made meanwhile.
+    let mut catalog = load_catalog().map_err(|error| {
+        std::io::Error::other(format!(
+            "remote prepared, but machine was not saved: {error}"
+        ))
+    })?;
     let id = match catalog.add_ssh(label, target, session) {
         Ok(id) => id,
         Err(error) => {
@@ -139,9 +160,13 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     };
-    store_catalog(&catalog)?;
-    println!("Saved SSH machine {id}.");
-    println!("Run Herdr to connect, or use `{bootstrap}` for interactive setup.");
+    store_catalog(&catalog).map_err(|error| {
+        std::io::Error::other(format!(
+            "remote prepared, but machine was not saved: {error}"
+        ))
+    })?;
+    println!("Saved SSH machine {id}. Remote server is ready.");
+    println!("Open Herdr clients connect automatically.");
     Ok(0)
 }
 

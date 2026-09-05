@@ -56,7 +56,9 @@ herdr machine enable <profile-id>
 herdr machine remove <profile-id>
 ```
 
-Saved machines appear beside Local in the machine sidebar the next time Herdr starts. Each profile stores an opaque ID, label, SSH target, explicit remote session, and enabled state in client state. Herdr does not store passwords, private keys, or other SSH credentials.
+`machine add` checks the remote installation's capabilities, installs or updates with approval only when needed, and starts the requested session's background server before saving. Compatible release versions do not need to match. Run setup in an interactive terminal when installation or restart approval is required; failed or cancelled setup does not save a profile.
+
+Changes apply automatically to open local Herdr clients, normally within a second. Added or enabled machines connect in the background; renaming does not reconnect. Removing or disabling disconnects only that machine and leaves its remote sessions running. Removing the machine you are viewing returns to Local, or shows Local as unavailable until it reconnects. Each profile stores an opaque ID, label, SSH target, explicit remote session, and enabled state in client state. Herdr does not store passwords, private keys, or other SSH credentials.
 
 Automatic connections and reconnects are non-interactive. If a host key, password, key passphrase, MFA step, install, update, or restart needs approval, the machine shows Attention instead of opening a hidden prompt. Run the standalone command printed by Herdr, such as `herdr --remote workbox --session agents --handoff`, to complete that setup in the foreground, then restart the client.
 

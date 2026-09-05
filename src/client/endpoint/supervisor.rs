@@ -99,6 +99,37 @@ impl EndpointSupervisors {
         self.endpoints.insert(ClientEndpointId::Local, state);
     }
 
+    pub(crate) fn reconcile_profiles(
+        &mut self,
+        profiles: &[super::SavedSshEndpoint],
+        now: Instant,
+    ) -> Vec<ClientEndpointId> {
+        let mut retired = Vec::new();
+        self.endpoints.retain(|endpoint_id, state| {
+            let ConnectTarget::Ssh(previous) = &state.target else {
+                return true;
+            };
+            let keep = profiles.iter().any(|profile| {
+                profile.id == previous.id
+                    && profile.enabled
+                    && profile.target == previous.target
+                    && profile.session == previous.session
+            });
+            if !keep {
+                retired.push(endpoint_id.clone());
+            }
+            keep
+        });
+        for profile in profiles.iter().filter(|profile| profile.enabled) {
+            let state = self
+                .endpoints
+                .entry(ClientEndpointId::Ssh(profile.id.clone()))
+                .or_insert_with(|| ReconnectState::new(ConnectTarget::Ssh(profile.clone()), now));
+            state.target = ConnectTarget::Ssh(profile.clone());
+        }
+        retired
+    }
+
     pub(crate) fn spawn_due(
         &mut self,
         now: Instant,
@@ -322,6 +353,76 @@ mod tests {
             session: "agents".into(),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn live_catalog_preserves_renamed_connections_and_local_recovery() {
+        let now = Instant::now();
+        let mut profile = profile();
+        let id = ClientEndpointId::Ssh(profile.id.clone());
+        let mut supervisors = EndpointSupervisors::new(&[profile.clone()], now);
+        supervisors.add_local(PathBuf::from("local"), Some(1), now);
+        let state = supervisors.endpoints.get_mut(&id).unwrap();
+        state.generation = Some(7);
+        state.attempts = 3;
+        state.next_attempt = Some(now + Duration::from_secs(4));
+        profile.label = "Renamed".into();
+        assert!(supervisors.reconcile_profiles(&[profile], now).is_empty());
+        let state = &supervisors.endpoints[&id];
+        assert_eq!(state.generation, Some(7));
+        assert_eq!(state.attempts, 3);
+        assert_eq!(state.next_attempt, Some(now + Duration::from_secs(4)));
+        assert_eq!(
+            supervisors.endpoints[&ClientEndpointId::Local].generation,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn live_catalog_add_disable_enable_and_remove_fence_late_connections() {
+        let now = Instant::now();
+        let mut profile = profile();
+        let id = ClientEndpointId::Ssh(profile.id.clone());
+        let mut supervisors = EndpointSupervisors::new(&[], now);
+        assert!(supervisors
+            .reconcile_profiles(&[profile.clone()], now)
+            .is_empty());
+        assert_eq!(supervisors.endpoints[&id].next_attempt, Some(now));
+        supervisors.endpoints.get_mut(&id).unwrap().generation = Some(7);
+        supervisors.next_generation = 8;
+        profile.enabled = false;
+        assert_eq!(
+            supervisors.reconcile_profiles(&[profile.clone()], now),
+            vec![id.clone()]
+        );
+        assert!(!supervisors.record_status(&id, 7, ClientEndpointStatus::Online, now));
+        profile.enabled = true;
+        assert!(supervisors
+            .reconcile_profiles(&[profile.clone()], now)
+            .is_empty());
+        assert!(!supervisors.record_status(&id, 7, ClientEndpointStatus::Online, now));
+        assert_eq!(supervisors.next_generation, 8);
+        assert_eq!(supervisors.reconcile_profiles(&[], now), vec![id.clone()]);
+        assert!(!supervisors.record_status(&id, 7, ClientEndpointStatus::Online, now));
+    }
+
+    #[test]
+    fn live_catalog_destination_change_retires_only_that_machine() {
+        let now = Instant::now();
+        let mut changed = profile();
+        let other = super::super::SavedSshEndpoint::new("Other", "other", "main").unwrap();
+        let id = ClientEndpointId::Ssh(changed.id.clone());
+        let other_id = ClientEndpointId::Ssh(other.id.clone());
+        let mut supervisors = EndpointSupervisors::new(&[changed.clone(), other.clone()], now);
+        supervisors.endpoints.get_mut(&id).unwrap().generation = Some(2);
+        supervisors.endpoints.get_mut(&other_id).unwrap().generation = Some(3);
+        changed.session = "another-session".into();
+        assert_eq!(
+            supervisors.reconcile_profiles(&[changed, other], now),
+            vec![id.clone()]
+        );
+        assert_eq!(supervisors.endpoints[&id].generation, None);
+        assert_eq!(supervisors.endpoints[&other_id].generation, Some(3));
     }
 
     #[test]

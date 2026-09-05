@@ -103,6 +103,11 @@ impl EndpointCatalog {
         Self::load_from_paths(&catalog_path(), &selection_path())
     }
 
+    pub(crate) fn load_profiles() -> Result<Vec<SavedSshEndpoint>, String> {
+        // Live clients keep their own selection, independent of other attached clients.
+        Self::load_from_path(&catalog_path()).map(|catalog| catalog.ssh)
+    }
+
     fn load_from_paths(catalog_path: &Path, selection_path: &Path) -> Result<Self, String> {
         let mut catalog = Self::load_from_path(catalog_path)?;
         match load_selection_from_path(selection_path) {

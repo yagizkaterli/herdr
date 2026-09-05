@@ -12,7 +12,7 @@ pub(super) fn command() -> Command {
         )
         .subcommand(
             Command::new("add")
-                .about("Save an SSH machine")
+                .about("Prepare the remote Herdr server and save an SSH machine")
                 .arg(
                     Arg::new("ssh-target")
                         .value_name("SSH_TARGET")

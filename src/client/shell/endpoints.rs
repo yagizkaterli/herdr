@@ -40,7 +40,10 @@ impl ClientShellState {
             let previous = self
                 .endpoints
                 .iter()
-                .find(|endpoint| endpoint.endpoint_id == endpoint_id);
+                .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+                .filter(|endpoint| {
+                    profile.enabled && endpoint.status != ClientEndpointStatus::Disabled
+                });
             next.push(ClientShellEndpoint {
                 endpoint_id,
                 label: profile.label.clone(),
@@ -68,18 +71,38 @@ impl ClientShellState {
             .iter()
             .any(|endpoint| endpoint.endpoint_id == self.active_endpoint_id)
         {
-            self.active_endpoint_id = ClientEndpointId::Local;
-            self.pane_surface = None;
-            self.pending_pane_surface = None;
-            if let Some(snapshot) = next[0].snapshot.clone() {
-                self.apply_active_snapshot(snapshot);
-            }
+            self.select_unavailable_local();
         }
         self.collapsed_endpoints.retain(|endpoint_id| {
             next.iter()
                 .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
         });
         self.endpoints = next;
+    }
+
+    pub(crate) fn select_unavailable_local(&mut self) {
+        self.reset_endpoint_projection();
+        self.active_endpoint_id = ClientEndpointId::Local;
+        self.mode = ClientShellMode::Terminal;
+        self.snapshot = None;
+        self.graphics.set_scope("local:unavailable");
+        self.reconcile_input_source();
+    }
+
+    pub(crate) fn retire_endpoint(&mut self, endpoint_id: &ClientEndpointId) {
+        self.retire_endpoint_notifications(endpoint_id);
+        if let Some(endpoint) = self
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        {
+            endpoint.status = ClientEndpointStatus::Disabled;
+            endpoint.snapshot = None;
+            endpoint.snapshot_generation = None;
+            endpoint.methods = None;
+            endpoint.agent_recency.clear();
+            endpoint.agent_presentation = Default::default();
+        }
     }
 
     pub(crate) fn set_endpoint_status(
